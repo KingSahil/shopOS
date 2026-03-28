@@ -31,7 +31,7 @@ KiranaKeeper is split into two working parts:
 
 ## Getting started
 
-### Website
+### Website formate
 
 See [website/README.md](C:/projects/kiranaKeeper/website/README.md)
 
