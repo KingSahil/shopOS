@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import TopBar from '../components/TopBar';
 import { useToast } from '../contexts/ToastContext';
 import Modal from '../components/Modal';
-import { collection, onSnapshot, addDoc, query, orderBy } from 'firebase/firestore';
+import { collection, onSnapshot, addDoc, query, orderBy, doc, updateDoc } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from '../firebase';
 
 export default function InventoryView() {
@@ -10,6 +10,7 @@ export default function InventoryView() {
   const [isAddProductOpen, setIsAddProductOpen] = useState(false);
   const [inventoryItems, setInventoryItems] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const normalizeProductName = (value: unknown) => String(value ?? '').trim().toLowerCase();
 
   useEffect(() => {
     if (!auth.currentUser) return;
@@ -18,11 +19,41 @@ export default function InventoryView() {
     const q = query(inventoryRef, orderBy('name'));
     
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      const items = snapshot.docs.map(doc => ({
-        ...doc.data(),
-        id: doc.id
-      }));
-      setInventoryItems(items);
+      const groupedItems = new Map<string, any>();
+
+      snapshot.docs.forEach((inventoryDoc) => {
+        const data = inventoryDoc.data();
+        const normalizedName = normalizeProductName(data.name);
+        const safeStock = Math.max(0, Number(data.stock) || 0);
+        const safeUnitPrice = Number(data.unitPrice) || 0;
+        const existingItem = groupedItems.get(normalizedName);
+
+        if (!existingItem) {
+          groupedItems.set(normalizedName, {
+            ...data,
+            id: inventoryDoc.id,
+            stock: safeStock,
+            unitPrice: safeUnitPrice,
+            price: safeUnitPrice * safeStock,
+            maxStock: Math.max(Number(data.maxStock) || 0, safeStock, 100),
+            status: safeStock < 20 ? 'error' : 'tertiary'
+          });
+          return;
+        }
+
+        const mergedStock = existingItem.stock + safeStock;
+        const mergedUnitPrice = safeUnitPrice || existingItem.unitPrice || 0;
+        groupedItems.set(normalizedName, {
+          ...existingItem,
+          stock: mergedStock,
+          unitPrice: mergedUnitPrice,
+          price: mergedUnitPrice * mergedStock,
+          maxStock: Math.max(existingItem.maxStock || 0, Number(data.maxStock) || 0, mergedStock, 100),
+          status: mergedStock < 20 ? 'error' : 'tertiary'
+        });
+      });
+
+      setInventoryItems(Array.from(groupedItems.values()));
       setIsLoading(false);
     }, (error) => {
       handleFirestoreError(error, OperationType.GET, `users/${auth.currentUser?.uid}/inventory`);
@@ -45,10 +76,12 @@ export default function InventoryView() {
     const price = unitPrice * stock;
     const maxStock = Math.max(100, stock * 2);
     const sku = (formData.get('sku') as string) || `SKU-${Math.floor(Math.random() * 10000)}`;
+    const name = (formData.get('name') as string || '').trim();
+    const normalizedName = normalizeProductName(name);
     
     const newItem = {
       id: Date.now(), // Using timestamp as numeric ID for schema compatibility
-      name: formData.get('name') as string,
+      name,
       sku,
       category: formData.get('category') as string,
       stock,
@@ -60,8 +93,27 @@ export default function InventoryView() {
 
     try {
       const inventoryRef = collection(db, `users/${auth.currentUser.uid}/inventory`);
-      await addDoc(inventoryRef, newItem);
-      showToast('Product added successfully', 'success');
+      const existingItem = inventoryItems.find(item => normalizeProductName(item.name) === normalizedName);
+
+      if (existingItem) {
+        const updatedStock = Math.max(0, Number(existingItem.stock) || 0) + stock;
+        const updatedUnitPrice = unitPrice;
+        await updateDoc(doc(db, `users/${auth.currentUser.uid}/inventory/${existingItem.id}`), {
+          name,
+          sku,
+          category: formData.get('category') as string,
+          stock: updatedStock,
+          unitPrice: updatedUnitPrice,
+          price: updatedUnitPrice * updatedStock,
+          maxStock: Math.max(Number(existingItem.maxStock) || 0, updatedStock, updatedStock * 2, 100),
+          status: updatedStock < 20 ? 'error' : 'tertiary'
+        });
+        showToast('Product stock updated successfully', 'success');
+      } else {
+        await addDoc(inventoryRef, newItem);
+        showToast('Product added successfully', 'success');
+      }
+
       setIsAddProductOpen(false);
       form.reset();
     } catch (error) {
@@ -170,7 +222,11 @@ export default function InventoryView() {
               <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
             </div>
           ) : (
-            inventoryItems.map((item, idx) => (
+            inventoryItems.map((item, idx) => {
+              const safeStock = Math.max(0, Number(item.stock) || 0);
+              const stockRatio = item.maxStock > 0 ? Math.min(100, Math.max(0, (safeStock / item.maxStock) * 100)) : 0;
+
+              return (
               <div key={item.id || idx} className={`bg-surface-container-lowest p-5 rounded-[1.5rem] ghost-border flex flex-col md:grid md:grid-cols-12 gap-4 items-center hover:bg-surface-bright transition-all ambient-shadow relative overflow-hidden group`}>
                 {item.status === 'error' && <div className="absolute left-0 top-0 h-full w-1.5 bg-error"></div>}
                 
@@ -189,9 +245,9 @@ export default function InventoryView() {
                 </div>
                 
                 <div className="col-span-2 flex flex-col items-center gap-1 w-full">
-                  <span className={`text-${item.status} font-extrabold text-sm`}>{item.stock} Units{item.status === 'error' ? ' Left' : ''}</span>
+                  <span className={`text-${item.status} font-extrabold text-sm`}>{safeStock} Units{item.status === 'error' ? ' Left' : ''}</span>
                   <div className="w-24 h-1.5 bg-surface-container-high rounded-full overflow-hidden">
-                    <div className={`bg-${item.status} h-full rounded-full`} style={{ width: `${(item.stock / item.maxStock) * 100}%` }}></div>
+                    <div className={`bg-${item.status} h-full rounded-full`} style={{ width: `${stockRatio}%` }}></div>
                   </div>
                 </div>
                 
@@ -209,7 +265,7 @@ export default function InventoryView() {
                   </button>
                 </div>
               </div>
-            ))
+            )})
           )}
         </div>
 

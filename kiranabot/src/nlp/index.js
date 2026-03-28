@@ -1,8 +1,8 @@
 import { parseNaturalLanguageOrder, parseAdminQuery, isLLMConfigured } from './groq.js';
 import { buildCart, generateOrderSummary, generateNextStepPrompt, shouldAttemptNLParsing } from './parser.js';
-import { menu } from '../menu.js';
+import { menu, refreshMenuFromFirebase, formatMenuMessage } from '../menu.js';
 import { setState } from '../storage.js';
-import { saveOrderToFirebase, cancelLastOrderFromFirebase, fetchAdminSummaryData } from '../firebase_client.js';
+import { saveOrderToFirebase, cancelLastOrderFromFirebase, fetchAdminSummaryData, validateInventoryAvailability } from '../firebase_client.js';
 import { extractPhoneFromJid } from '../utils.js';
 
 /**
@@ -86,6 +86,7 @@ export class NLOrderProcessor {
       }
 
       // --- 🛒 CUSTOMER FLOW ---
+      await refreshMenuFromFirebase();
       
       // 🔥 PRE-FILTER: Only attempt NL parsing if the message looks like an order
       // This prevents "yes", "no", etc. from being intercepted by AI
@@ -115,14 +116,7 @@ export class NLOrderProcessor {
       // --- HANDLE SHOW MENU INTENT ---
       if (parsedOrder.intent === 'show_menu') {
         let msg = parsedOrder.response ? `${parsedOrder.response}\n\n` : '';
-        msg += '🌟 *OUR CATALOG* 🌟\n';
-        msg += '━━━━━━━━━━━━━━━━\n\n';
-        Object.keys(menu).map((value) => {
-          const element = menu[value];
-          msg += `📦 *${element.description}*\n`;
-          msg += `💰 Price: ₹${element.price}\n\n`;
-        });
-        msg += '━━━━━━━━━━━━━━━━\n';
+        msg += formatMenuMessage();
         
         return finishWithHistory(msg);
       }
@@ -191,6 +185,25 @@ export class NLOrderProcessor {
         return null;
       }
 
+      const availableStock = Math.max(0, Number(menuMatchedItem.stock) || 0);
+      if (availableStock <= 0) {
+        return finishWithHistory(`❌ *${menuMatchedItem.description}* is currently out of stock.\n\nType *menu* to see the latest inventory.`);
+      }
+
+      if (quantity > availableStock) {
+        return finishWithHistory(`❌ Only *${availableStock}* units of *${menuMatchedItem.description}* are left in inventory.\n\nPlease send a smaller quantity.`);
+      }
+
+      const availability = await validateInventoryAvailability([{
+        id: menuMatchedItem.id,
+        description: menuMatchedItem.description,
+        quantity
+      }]);
+
+      if (!availability.ok) {
+        return finishWithHistory(`❌ ${availability.message}`);
+      }
+
       state.pendingItem = menuMatchedItem;
       state.pendingQuantity = quantity;
       state.stage = 2; 
@@ -202,6 +215,7 @@ export class NLOrderProcessor {
 ━━━━━━━━━━━━━━━━
 
 📦 *Item:* ${quantityStr}${menuMatchedItem.description}
+📊 *Left in stock:* ${availableStock}
 💰 *Total:* ₹${totalValue}
 
 👉 Reply *YES* to confirm or *NO* to cancel.`);

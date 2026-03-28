@@ -1,22 +1,15 @@
-import { menu } from '../menu.js';
+import { menu, refreshMenuFromFirebase, formatMenuMessage } from '../menu.js';
 import { setState } from '../storage.js';
 
 export const stageOne = {
-  exec({ from, message, client, state }) {
+  async exec({ from, message, client, state }) {
     const text = (message || '').toLowerCase().trim();
+
+    await refreshMenuFromFirebase();
 
     // Check for "show me the menu" intent
     if (text === 'show me the menu' || text.includes('menu')) {
-      let msg = '🌟 *OUR CATALOG* 🌟\n';
-      msg += '━━━━━━━━━━━━━━━━\n\n';
-      
-      Object.keys(menu).map((value) => {
-        const element = menu[value];
-        msg += `📦 *${element.description}*\n`;
-        msg += `💰 Price: ₹${element.price}\n\n`;
-      });
-      
-      msg += '━━━━━━━━━━━━━━━━\n';
+      let msg = formatMenuMessage();
       msg += 'Type the *item name* to start your order! 🚀';
       return msg;
     }
@@ -70,17 +63,30 @@ export const stageOne = {
       }
 
       if (matchedItem) {
+        const availableStock = Math.max(0, Number(matchedItem.stock) || 0);
+        if (availableStock <= 0) {
+          return `❌ *${matchedItem.description}* is currently out of stock.\n\nType *menu* to see what is available right now.`;
+        }
+
+        if (parsedQty > availableStock) {
+          return `❌ Only *${availableStock}* units of *${matchedItem.description}* are left in inventory.\n\nPlease send a smaller quantity.`;
+        }
+
         // Staging for confirmation
         state.pendingItem = matchedItem;
         state.pendingQuantity = parsedQty;
         state.stage = 2; 
         setState(from, state);
-        
+        const qtyStr = parsedQty > 1 ? `${parsedQty}x ` : '';
+        const total = (matchedItem.price || 0) * parsedQty;
+
         return `🛒 *CONFIRM ORDER* 🛒
 ━━━━━━━━━━━━━━━━
 
-📦 *Item:* ${matchedItem.description}
+📦 *Item:* ${qtyStr}${matchedItem.description}
 💰 *Price:* ₹${matchedItem.price}
+📊 *Left in stock:* ${availableStock}
+💵 *Total:* ₹${total}
 
 👉 Reply with *YES* to confirm or *NO* to cancel.`;
       } else {

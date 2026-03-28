@@ -92,6 +92,9 @@ async function startServer() {
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
+      optimizeDeps: {
+        include: ['@zxing/browser', '@zxing/library'],
+      },
       server: { middlewareMode: true },
       appType: "spa",
     });

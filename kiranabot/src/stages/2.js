@@ -1,5 +1,6 @@
 import { setState } from '../storage.js';
 import { extractPhoneFromJid } from '../utils.js';
+import { validateInventoryAvailability } from '../firebase_client.js';
 
 const YES_WORDS = ['yes', 'yes i want this', 'kardo', 'haan', 'ha', 'ji', 'confirm', 'theek', 'ok', 'okay', 'sure', 'bilkul', 'done'];
 const NO_WORDS = ['no', 'nahi', 'na', 'nope', 'cancel', 'mat', 'rehne', 'rehne do', 'band karo'];
@@ -19,6 +20,20 @@ export const stageTwo = {
         state.stage = 1;
         setState(from, state);
         return 'Something went wrong, please try ordering again.';
+      }
+
+      const availability = await validateInventoryAvailability([{
+        id: item.id,
+        description: item.description,
+        quantity
+      }]);
+
+      if (!availability.ok) {
+        state.stage = 1;
+        state.pendingItem = null;
+        state.pendingQuantity = null;
+        setState(from, state);
+        return `❌ ${availability.message}\n\nType *menu* to see the latest inventory.`;
       }
 
       // 👤 Check if we already know the customer's name

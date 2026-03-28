@@ -1,6 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithEmailAndPassword } from 'firebase/auth';
-import { getFirestore, collection, addDoc, getDocs, collectionGroup, query, where, updateDoc, deleteDoc, orderBy, limit, doc, setDoc, getDoc, writeBatch, increment } from 'firebase/firestore';
+import { getFirestore, collection, addDoc, getDocs, collectionGroup, query, where, updateDoc, deleteDoc, doc, setDoc, runTransaction, getDoc } from 'firebase/firestore';
 
 const firebaseConfig = {
   apiKey: "AIzaSyDL1BDF5M78MWd_E35UEz31lXBxbI3hpDE",
@@ -17,39 +17,139 @@ const auth = getAuth(app);
 export const db = getFirestore(app);
 
 let isAuthenticated = false;
+let authAttempted = false;
+let resolvedStoreUserId = null;
+let lastAuthFailureReason = null;
 
 async function authenticateFirebase() {
   if (isAuthenticated) return true;
-  const email = process.env.FIREBASE_EMAIL;
-  const password = process.env.FIREBASE_PASSWORD;
+  if (authAttempted) return false;
+  authAttempted = true;
+  const email = String(process.env.FIREBASE_EMAIL || '').trim();
+  const password = String(process.env.FIREBASE_PASSWORD || '').trim();
   
   if (!email || !password) {
     console.error("Firebase email or password missing in .env. Cannot sync orders to website.");
+    lastAuthFailureReason = 'missing-credentials';
     return false;
   }
   
   try {
     await signInWithEmailAndPassword(auth, email, password);
     isAuthenticated = true;
+    authAttempted = false;
+    lastAuthFailureReason = null;
     console.log("Logged into Firebase successfully.");
     return true;
   } catch (error) {
     console.error("Firebase authentication failed:", error);
+    lastAuthFailureReason = error?.code || 'auth-failed';
     return false;
+  }
+}
+
+export function getLastFirebaseAuthFailureReason() {
+  return lastAuthFailureReason;
+}
+
+export async function resolveStoreUserId() {
+  if (resolvedStoreUserId) {
+    return resolvedStoreUserId;
+  }
+
+  const isReady = await authenticateFirebase();
+  if (!isReady) {
+    return null;
+  }
+
+  if (auth.currentUser?.uid) {
+    resolvedStoreUserId = auth.currentUser.uid;
+    return resolvedStoreUserId;
+  }
+  const inventoryGroupRef = collectionGroup(db, 'inventory');
+  const inventorySnap = await getDocs(inventoryGroupRef);
+
+  if (inventorySnap.empty) {
+    return null;
+  }
+
+  resolvedStoreUserId = inventorySnap.docs[0].ref.path.split('/')[1];
+  return resolvedStoreUserId;
+}
+
+function normalizeStockValue(value) {
+  return Math.max(0, Number(value) || 0);
+}
+
+export async function validateInventoryAvailability(items) {
+  try {
+    const userId = await resolveStoreUserId();
+
+    if (!userId) {
+      return {
+        ok: false,
+        code: 'inventory_missing',
+        message: 'Inventory is not available right now.'
+      };
+    }
+
+    for (const item of items) {
+      if (!item?.id) {
+        return {
+          ok: false,
+          code: 'item_missing',
+          message: `"${item?.description || 'This item'}" is not available in the inventory right now.`
+        };
+      }
+
+      const itemRef = doc(db, `users/${userId}/inventory/${item.id}`);
+      const itemSnap = await getDoc(itemRef);
+
+      if (!itemSnap.exists()) {
+        return {
+          ok: false,
+          code: 'item_missing',
+          message: `"${item.description}" is not available in the inventory right now.`
+        };
+      }
+
+      const inventoryItem = itemSnap.data();
+      const availableStock = normalizeStockValue(inventoryItem.stock);
+      const requestedQuantity = Math.max(1, Number(item.quantity) || 1);
+
+      if (requestedQuantity > availableStock) {
+        return {
+          ok: false,
+          code: 'insufficient_stock',
+          message: `Only ${availableStock} units of ${inventoryItem.name || item.description} are left in inventory. Please reduce the quantity.`
+        };
+      }
+    }
+
+    return { ok: true, userId };
+  } catch (error) {
+    console.error('Error validating inventory availability:', error);
+    return {
+      ok: false,
+      code: 'inventory_check_failed',
+      message: 'Could not check inventory right now. Please try again.'
+    };
   }
 }
 
 export async function saveOrderToFirebase({ phone, items, totalAmount, customerName, paymentStatus = 'Pending' }) {
   try {
-    const inventoryGroupRef = collectionGroup(db, 'inventory');
-    const inventorySnap = await getDocs(inventoryGroupRef);
-    
-    if (inventorySnap.empty) {
+    const userId = await resolveStoreUserId();
+
+    if (!userId) {
         console.error("No inventory found. Ensure the catalog is synced before placing orders.");
-        return false;
+        return {
+          ok: false,
+          code: 'inventory_missing',
+          message: 'Inventory is not available right now.'
+        };
     }
-    const userId = inventorySnap.docs[0].ref.path.split('/')[1];
-    
+
     const ordersRef = collection(db, `users/${userId}/orders`);
     const cleanPhone = phone.replace(/\D/g, '');
     
@@ -71,33 +171,47 @@ export async function saveOrderToFirebase({ phone, items, totalAmount, customerN
       items: items // Save the items details
     };
     
-    await addDoc(ordersRef, orderDoc);
-    console.log("Order successfully saved to Firebase!");
+    await runTransaction(db, async (transaction) => {
+      for (const item of items) {
+        if (!item.id) {
+          throw new Error(`"${item.description || 'This item'}" is not available in the inventory right now.`);
+        }
 
-    // 📉 Update Inventory Stock atomically
-    const batch = writeBatch(db);
-    for (const item of items) {
-      if (!item.id) continue;
-      const itemRef = doc(db, `users/${userId}/inventory/${item.id}`);
-      
-      // Update the stock using increment for atomicity
-      // and status based on a rough estimate (using current fetched stock)
-      const estNewStock = Math.max(0, (item.stock || 0) - (item.quantity || 1));
-      const newStatus = estNewStock < 20 ? 'error' : 'tertiary';
-      
-      batch.update(itemRef, { 
-        stock: increment(-(item.quantity || 1)),
-        status: newStatus
-      });
-      console.log(`📉 Queued stock update for ${item.description}: -${item.quantity || 1}`);
-    }
-    await batch.commit();
-    console.log("✅ Inventory batch update completed.");
+        const itemRef = doc(db, `users/${userId}/inventory/${item.id}`);
+        const inventorySnap = await transaction.get(itemRef);
 
-    return true;
+        if (!inventorySnap.exists()) {
+          throw new Error(`"${item.description}" is not available in the inventory right now.`);
+        }
+
+        const inventoryItem = inventorySnap.data();
+        const availableStock = normalizeStockValue(inventoryItem.stock);
+        const requestedQuantity = Math.max(1, Number(item.quantity) || 1);
+
+        if (requestedQuantity > availableStock) {
+          throw new Error(`Only ${availableStock} units of ${inventoryItem.name || item.description} are left in inventory. Please reduce the quantity.`);
+        }
+
+        const newStock = Math.max(0, availableStock - requestedQuantity);
+        transaction.update(itemRef, {
+          stock: newStock,
+          status: newStock < 20 ? 'error' : 'tertiary'
+        });
+      }
+
+      transaction.set(doc(ordersRef), orderDoc);
+    });
+
+    console.log("Order successfully saved to Firebase and inventory updated.");
+
+    return { ok: true };
   } catch (error) {
     console.error("Error saving order to Firebase:", error);
-    return false;
+    return {
+      ok: false,
+      code: 'order_save_failed',
+      message: error instanceof Error ? error.message : 'Failed to save order.'
+    };
   }
 }
 
@@ -110,15 +224,12 @@ export async function cancelLastOrderFromFirebase(phone) {
     const cleanPhone = phone.replace(/\D/g, ''); 
     console.log(`🔍 Resolving merchant ID to find orders for: ${cleanPhone}`);
     
-    // Get userId from inventory (standard way for this bot)
-    const inventoryGroupRef = collectionGroup(db, 'inventory');
-    const inventorySnap = await getDocs(inventoryGroupRef);
+    const userId = await resolveStoreUserId();
     
-    if (inventorySnap.empty) {
+    if (!userId) {
       console.error("❌ No inventory found. Cannot resolve merchant ID.");
       return false;
     }
-    const userId = inventorySnap.docs[0].ref.path.split('/')[1];
     console.log(`🏢 Searching in orders for store owner: ${userId}`);
     
     // Fetch recent orders from THIS user's collection (prevents index requirements for collectionGroup)
@@ -166,11 +277,9 @@ export async function cancelLastOrderFromFirebase(phone) {
 
 export async function saveUdharToFirebase({ phone, customerName, amount }) {
   try {
-    const inventoryGroupRef = collectionGroup(db, 'inventory');
-    const inventorySnap = await getDocs(inventoryGroupRef);
+    const userId = await resolveStoreUserId();
     
-    if (inventorySnap.empty) return false;
-    const userId = inventorySnap.docs[0].ref.path.split('/')[1];
+    if (!userId) return false;
     
     const udharRef = collection(db, `users/${userId}/udhar`);
     
@@ -215,31 +324,54 @@ export async function saveUdharToFirebase({ phone, customerName, amount }) {
 
 export async function fetchMenuFromFirebase() {
   try {
-    const inventoryRef = collectionGroup(db, 'inventory');
+    const userId = await resolveStoreUserId();
+    if (!userId) {
+      return null;
+    }
+
+    const inventoryRef = collection(db, `users/${userId}/inventory`);
     const snapshot = await getDocs(inventoryRef);
     
     const menuObj = {};
-    const seenNames = new Set();
+    const groupedItems = new Map();
     let index = 1;
     
-    snapshot.forEach(doc => {
-      const data = doc.data();
+    snapshot.forEach((inventoryDoc) => {
+      const data = inventoryDoc.data();
       const name = (data.name || '').trim();
+      const normalizedName = name.toLowerCase();
       
-      if (!name || seenNames.has(name.toLowerCase())) {
+      if (!name) {
         return;
       }
-      
-      seenNames.add(name.toLowerCase());
-      menuObj[index] = {
-        description: name,
-        price: data.unitPrice || 0,
-        id: doc.id,
-        sku: data.sku || '',
-        stock: data.stock || 0,
-      };
-      index++;
+
+      const safeStock = normalizeStockValue(data.stock);
+      const existingItem = groupedItems.get(normalizedName);
+
+      if (!existingItem) {
+        groupedItems.set(normalizedName, {
+          description: name,
+          price: Number(data.unitPrice) || 0,
+          id: inventoryDoc.id,
+          sku: data.sku || '',
+          stock: safeStock,
+        });
+        return;
+      }
+
+      groupedItems.set(normalizedName, {
+        ...existingItem,
+        price: Number(data.unitPrice) || existingItem.price || 0,
+        sku: data.sku || existingItem.sku || '',
+        stock: existingItem.stock + safeStock,
+      });
     });
+
+    groupedItems.forEach((item) => {
+      menuObj[index] = item;
+      index += 1;
+    });
+
     console.log(`Fetched ${Object.keys(menuObj).length} unique menu items from Firebase.`);
     return menuObj;
   } catch (error) {
@@ -254,14 +386,17 @@ export async function fetchMenuFromFirebase() {
  */
 export async function updateBotStatusInFirebase(status) {
   try {
-    const inventoryGroupRef = collectionGroup(db, 'inventory');
-    const inventorySnap = await getDocs(inventoryGroupRef);
+    const userId = await resolveStoreUserId();
     
-    if (inventorySnap.empty) {
-      console.warn("No inventory found to resolve userId for bot status.");
+    if (!userId) {
+      const authFailureReason = getLastFirebaseAuthFailureReason();
+      if (authFailureReason) {
+        console.warn(`Bot status sync skipped because Firebase auth failed (${authFailureReason}).`);
+      } else {
+        console.warn("No inventory found to resolve userId for bot status.");
+      }
       return;
     }
-    const userId = inventorySnap.docs[0].ref.path.split('/')[1];
     const botStatusRef = doc(db, `users/${userId}/bot/status`);
     
     await setDoc(botStatusRef, {
@@ -279,13 +414,11 @@ export async function updateBotStatusInFirebase(status) {
  */
 export async function fetchAdminSummaryData() {
   try {
-    const inventoryGroupRef = collectionGroup(db, 'inventory');
-    const inventorySnap = await getDocs(inventoryGroupRef);
+    const userId = await resolveStoreUserId();
     
-    if (inventorySnap.empty) {
+    if (!userId) {
       return { orders: [], inventory: [], udhar: [] };
     }
-    const userId = inventorySnap.docs[0].ref.path.split('/')[1];
     
     // 1. Fetch Orders
     const ordersRef = collection(db, `users/${userId}/orders`);

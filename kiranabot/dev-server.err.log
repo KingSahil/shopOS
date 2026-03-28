@@ -1,0 +1,20 @@
+Firebase authentication failed: FirebaseError: Firebase: Error (auth/invalid-credential).
+    at createErrorInternal (file:///C:/projects/shopos/kiranabot/node_modules/@firebase/auth/dist/node-esm/totp-ed01b91b.js:499:41)
+    at _fail (file:///C:/projects/shopos/kiranabot/node_modules/@firebase/auth/dist/node-esm/totp-ed01b91b.js:474:11)
+    at _performFetchWithErrorHandling (file:///C:/projects/shopos/kiranabot/node_modules/@firebase/auth/dist/node-esm/totp-ed01b91b.js:961:17)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async _performSignInRequest (file:///C:/projects/shopos/kiranabot/node_modules/@firebase/auth/dist/node-esm/totp-ed01b91b.js:976:28)
+    at async _signInWithCredential (file:///C:/projects/shopos/kiranabot/node_modules/@firebase/auth/dist/node-esm/totp-ed01b91b.js:5695:22)
+    at async authenticateFirebase (file:///C:/projects/shopos/kiranabot/src/firebase_client.js:38:5)
+    at async resolveStoreUserId (file:///C:/projects/shopos/kiranabot/src/firebase_client.js:60:19)
+    at async fetchMenuFromFirebase (file:///C:/projects/shopos/kiranabot/src/firebase_client.js:327:20)
+    at async refreshMenuFromFirebase (file:///C:/projects/shopos/kiranabot/src/menu.js:15:20) {
+  code: 'auth/invalid-credential',
+  customData: {}
+}
+WhatsApp menu sync failed because Firebase auth is not working (auth/invalid-credential).
+🚫 Another bot instance is already running.
+   Lock file: C:\projects\shopos\kiranabot\tokens\session-name\.bot.lock
+   Existing PID: 53488
+   Stop the other process before starting this one.
+Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 76

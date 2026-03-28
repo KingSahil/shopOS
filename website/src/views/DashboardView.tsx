@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { BrowserMultiFormatReader, type IScannerControls } from '@zxing/browser';
 import TopBar from '../components/TopBar';
 import { useToast } from '../contexts/ToastContext';
 import Modal from '../components/Modal';
 import { ViewState } from '../types';
-import { collection, onSnapshot, doc, setDoc, updateDoc, writeBatch, increment } from 'firebase/firestore';
+import { collection, onSnapshot, doc, setDoc, updateDoc, runTransaction } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from '../firebase';
 
 declare global {
@@ -28,6 +29,10 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
   const [dashboardData, setDashboardData] = useState<any>(null);
   const [botStatus, setBotStatus] = useState<any>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [orders, setOrders] = useState<any[]>([]);
+  const [udharCustomers, setUdharCustomers] = useState<any[]>([]);
+  const [isOrdersLoading, setIsOrdersLoading] = useState(true);
+  const [isUdharLoading, setIsUdharLoading] = useState(true);
 
   // Quick Order State
   const [inventoryItems, setInventoryItems] = useState<any[]>([]);
@@ -40,14 +45,35 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
   const scannerStreamRef = useRef<MediaStream | null>(null);
   const scannerFrameRef = useRef<number | null>(null);
   const lastDetectedRef = useRef<{ code: string; detectedAt: number } | null>(null);
+  const scannerReaderRef = useRef<BrowserMultiFormatReader | null>(null);
+  const scannerControlsRef = useRef<IScannerControls | null>(null);
 
   const normalizeLookupValue = (value: unknown) => String(value ?? '').trim().toLowerCase();
+  const parseCurrencyValue = (value: unknown) => {
+    if (typeof value === 'number') return value;
+    return parseFloat(String(value ?? '').replace(/[^\d.-]/g, '')) || 0;
+  };
+  const formatCurrency = (value: number) => `₹${value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const isSameCalendarDay = (dateValue: unknown, referenceDate = new Date()) => {
+    const parsedDate = new Date(String(dateValue ?? ''));
+    if (Number.isNaN(parsedDate.getTime())) return false;
+
+    return parsedDate.getDate() === referenceDate.getDate()
+      && parsedDate.getMonth() === referenceDate.getMonth()
+      && parsedDate.getFullYear() === referenceDate.getFullYear();
+  };
 
   const getItemUnitPrice = (item: any) => (
     typeof item.unitPrice === 'number'
       ? item.unitPrice
       : parseFloat(String(item.price).replace(/[^\d.]/g, '')) || 0
   );
+  const getAvailableStock = (item: any) => Math.max(0, Number(item?.stock) || 0);
+  const showInsufficientStockAlert = (itemName: string, requestedQuantity: number, availableStock: number) => {
+    window.alert(
+      `The specified product amount is not available for ${itemName}. Requested: ${requestedQuantity}, available: ${availableStock}.`
+    );
+  };
 
   const findInventoryItemByCode = (rawCode: string) => {
     const normalizedCode = normalizeLookupValue(rawCode);
@@ -64,6 +90,8 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
 
     // Fetch Inventory
     const inventoryRef = collection(db, `users/${auth.currentUser.uid}/inventory`);
+    const ordersRef = collection(db, `users/${auth.currentUser.uid}/orders`);
+    const udharRef = collection(db, `users/${auth.currentUser.uid}/udhar`);
     const unsubscribeInventory = onSnapshot(inventoryRef, (snapshot) => {
       const items = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id }));
       setInventoryItems(items);
@@ -100,6 +128,32 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
       setIsLoading(false);
     });
 
+    const unsubscribeOrders = onSnapshot(ordersRef, (snapshot) => {
+      const items = snapshot.docs.map(orderDoc => ({
+        ...orderDoc.data(),
+        docId: orderDoc.id
+      }));
+      setOrders(items);
+      setIsOrdersLoading(false);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, `users/${auth.currentUser?.uid}/orders`);
+      showToast('Failed to load orders for dashboard', 'error');
+      setIsOrdersLoading(false);
+    });
+
+    const unsubscribeUdhar = onSnapshot(udharRef, (snapshot) => {
+      const items = snapshot.docs.map(udharDoc => ({
+        id: udharDoc.id,
+        ...udharDoc.data()
+      }));
+      setUdharCustomers(items);
+      setIsUdharLoading(false);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, `users/${auth.currentUser?.uid}/udhar`);
+      showToast('Failed to load udhar summary', 'error');
+      setIsUdharLoading(false);
+    });
+
     // Fetch Bot Status
     const botStatusRef = doc(db, `users/${auth.currentUser.uid}/bot/status`);
     const unsubscribeBotStatus = onSnapshot(botStatusRef, (docSnap) => {
@@ -113,11 +167,17 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
     return () => {
       unsubscribeInventory();
       unsubscribeDashboard();
+      unsubscribeOrders();
+      unsubscribeUdhar();
       unsubscribeBotStatus();
     };
   }, []);
 
   const stopScanner = () => {
+    scannerControlsRef.current?.stop();
+    scannerControlsRef.current = null;
+    scannerReaderRef.current = null;
+
     if (scannerFrameRef.current) {
       cancelAnimationFrame(scannerFrameRef.current);
       scannerFrameRef.current = null;
@@ -148,14 +208,28 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
   useEffect(() => () => stopScanner(), []);
 
   const handleSelectItem = (item: any, source: 'search' | 'barcode' = 'search') => {
-    setSelectedItems(currentItems => {
-      const existingItem = currentItems.find(i => i.id === item.id);
-      if (existingItem) {
-        return currentItems.map(i => i.id === item.id ? { ...i, quantity: i.quantity + 1 } : i);
+    const existingItem = selectedItems.find(i => i.id === item.id);
+    const availableStock = getAvailableStock(item);
+
+    if (availableStock <= 0) {
+      showInsufficientStockAlert(item.name, 1, availableStock);
+      showToast(`${item.name} is out of stock`, 'error');
+      return;
+    }
+
+    if (existingItem) {
+      const nextQuantity = existingItem.quantity + 1;
+      if (nextQuantity > availableStock) {
+        showInsufficientStockAlert(item.name, nextQuantity, availableStock);
+        showToast(`Only ${availableStock} units of ${item.name} are available`, 'error');
+        return;
       }
 
-      return [...currentItems, { ...item, quantity: 1 }];
-    });
+      setSelectedItems(selectedItems.map(i => i.id === item.id ? { ...i, quantity: nextQuantity } : i));
+    } else {
+      setSelectedItems([...selectedItems, { ...item, quantity: 1 }]);
+    }
+
     setSearchQuery('');
 
     const unitPrice = getItemUnitPrice(item);
@@ -173,13 +247,21 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
   };
 
   const handleQuantityChange = (id: string, delta: number) => {
-    setSelectedItems(currentItems => currentItems.map(i => {
-      if (i.id === id) {
-        const newQuantity = Math.max(1, i.quantity + delta);
-        return { ...i, quantity: newQuantity };
-      }
-      return i;
-    }));
+    const currentItem = selectedItems.find(i => i.id === id);
+    if (!currentItem) return;
+
+    const availableStock = getAvailableStock(currentItem);
+    const newQuantity = Math.max(1, currentItem.quantity + delta);
+
+    if (newQuantity > availableStock) {
+      showInsufficientStockAlert(currentItem.name, newQuantity, availableStock);
+      showToast(`Only ${availableStock} units of ${currentItem.name} are available`, 'error');
+      return;
+    }
+
+    setSelectedItems(selectedItems.map(i => (
+      i.id === id ? { ...i, quantity: newQuantity } : i
+    )));
   };
 
   const handleUnlink = async () => {
@@ -210,12 +292,6 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
   };
 
   const startBarcodeScanner = async () => {
-    if (!window.BarcodeDetector) {
-      setScannerError('This browser does not support live camera barcode scanning. You can still use a hardware scanner or type the SKU/barcode.');
-      showToast('Live barcode scanning is not supported on this device', 'error');
-      return;
-    }
-
     if (!navigator.mediaDevices?.getUserMedia) {
       setScannerError('Camera access is not available on this device. You can still use a hardware scanner or type the SKU/barcode.');
       showToast('Camera access is not available on this device', 'error');
@@ -242,42 +318,71 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
         await videoRef.current.play();
       }
 
-      const detector = new window.BarcodeDetector({
-        formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'codabar']
-      });
+      const processDetectedCode = (rawCode: string) => {
+        const normalizedCode = normalizeLookupValue(rawCode);
+        const now = Date.now();
+        const lastDetected = lastDetectedRef.current;
 
-      const scanFrame = async () => {
-        if (!videoRef.current) return;
+        if (!lastDetected || lastDetected.code !== normalizedCode || now - lastDetected.detectedAt > 2500) {
+          lastDetectedRef.current = { code: normalizedCode, detectedAt: now };
 
-        try {
-          const detectedBarcodes = await detector.detect(videoRef.current);
-          const rawCode = detectedBarcodes[0]?.rawValue;
-
-          if (rawCode) {
-            const normalizedCode = normalizeLookupValue(rawCode);
-            const now = Date.now();
-            const lastDetected = lastDetectedRef.current;
-
-            if (!lastDetected || lastDetected.code !== normalizedCode || now - lastDetected.detectedAt > 2500) {
-              lastDetectedRef.current = { code: normalizedCode, detectedAt: now };
-
-              const matchedItem = findInventoryItemByCode(rawCode);
-              if (matchedItem) {
-                handleSelectItem(matchedItem, 'barcode');
-              } else {
-                setScannerError(`Scanned code ${rawCode} was not found in inventory. Match against product barcode or SKU to enable auto-add.`);
-                showToast(`No inventory item found for barcode ${rawCode}`, 'error');
-              }
-            }
+          const matchedItem = findInventoryItemByCode(rawCode);
+          if (matchedItem) {
+            handleSelectItem(matchedItem, 'barcode');
+          } else {
+            setScannerError(`Scanned code ${rawCode} was not found in inventory. Match against product barcode or SKU to enable auto-add.`);
+            showToast(`No inventory item found for barcode ${rawCode}`, 'error');
           }
-        } catch (error) {
-          console.error('Barcode scan failed:', error);
         }
-
-        scannerFrameRef.current = requestAnimationFrame(scanFrame);
       };
 
-      scannerFrameRef.current = requestAnimationFrame(scanFrame);
+      if (window.BarcodeDetector) {
+        const detector = new window.BarcodeDetector({
+          formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'codabar']
+        });
+
+        const scanFrame = async () => {
+          if (!videoRef.current) return;
+
+          try {
+            const detectedBarcodes = await detector.detect(videoRef.current);
+            const rawCode = detectedBarcodes[0]?.rawValue;
+
+            if (rawCode) {
+              processDetectedCode(rawCode);
+            }
+          } catch (error) {
+            console.error('Barcode scan failed:', error);
+          }
+
+          scannerFrameRef.current = requestAnimationFrame(scanFrame);
+        };
+
+        scannerFrameRef.current = requestAnimationFrame(scanFrame);
+      } else {
+        const reader = new BrowserMultiFormatReader();
+        scannerReaderRef.current = reader;
+        scannerControlsRef.current = await reader.decodeFromConstraints(
+          {
+            video: {
+              facingMode: { ideal: 'environment' }
+            },
+            audio: false
+          },
+          videoRef.current ?? undefined,
+          (result, error) => {
+            if (result?.getText()) {
+              processDetectedCode(result.getText());
+              return;
+            }
+
+            if (error && error.name !== 'NotFoundException') {
+              console.error('Compatibility barcode scan failed:', error);
+            }
+          }
+        );
+        showToast('Compatibility barcode scanner started', 'info');
+      }
     } catch (error) {
       console.error('Error starting barcode scanner:', error);
       setIsScannerOpen(false);
@@ -302,6 +407,20 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
     const price = getItemUnitPrice(item);
     return sum + (price * item.quantity);
   }, 0);
+
+  const todaysRevenue = orders.reduce((sum, order) => {
+    if (!isSameCalendarDay(order.date) || order.status !== 'Delivered') {
+      return sum;
+    }
+
+    return sum + parseCurrencyValue(order.amount);
+  }, 0);
+
+  const totalPendingUdhar = udharCustomers.reduce((sum, customer) => {
+    return sum + parseCurrencyValue(customer.amount);
+  }, 0);
+
+  const isSummaryLoading = isLoading || isOrdersLoading || isUdharLoading;
 
   return (
     <>
@@ -334,11 +453,11 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
               <div className="bg-tertiary text-white w-10 h-10 rounded-full flex items-center justify-center">
                 <span className="material-symbols-outlined">payments</span>
               </div>
-              <span className="text-tertiary font-bold text-xs">{isLoading ? '...' : dashboardData?.revenueGrowth}</span>
+              <span className="text-tertiary font-bold text-xs">{isSummaryLoading ? '...' : dashboardData?.revenueGrowth}</span>
             </div>
             <div>
               <p className="text-on-surface-variant text-sm font-semibold">Today's Revenue</p>
-              <p className="text-on-surface font-headline text-2xl font-black">{isLoading ? '...' : dashboardData?.revenue}</p>
+              <p className="text-on-surface font-headline text-2xl font-black">{isSummaryLoading ? '...' : formatCurrency(todaysRevenue)}</p>
             </div>
           </div>
 
@@ -351,7 +470,7 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
             </div>
             <div>
               <p className="text-on-surface-variant text-sm font-semibold">Pending Udhar</p>
-              <p className="text-on-surface font-headline text-2xl font-black">{isLoading ? '...' : dashboardData?.pendingUdhar}</p>
+              <p className="text-on-surface font-headline text-2xl font-black">{isSummaryLoading ? '...' : formatCurrency(totalPendingUdhar)}</p>
             </div>
           </div>
         </section>
@@ -464,6 +583,11 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
             const customerName = formData.get('customerName') as string || 'Walk-in Customer';
             const customerPhone = formData.get('customerPhone') as string || 'N/A';
             
+            const ordersRef = collection(db, `users/${auth.currentUser.uid}/orders`);
+            const orderRef = doc(ordersRef);
+            const transactionsRef = collection(db, `users/${auth.currentUser.uid}/transactions`);
+            const transactionRef = doc(transactionsRef);
+
             const newOrder = {
               id: `#ORD-${Math.floor(Math.random() * 100000)}`,
               name: selectedItems.length === 1 ? selectedItems[0].name : `${selectedItems.length} Items`,
@@ -477,10 +601,6 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
               items: selectedItems
             };
 
-            const ordersRef = collection(db, `users/${auth.currentUser.uid}/orders`);
-            await setDoc(doc(ordersRef), newOrder);
-
-            // Also add a transaction
             const newTransaction = {
               id: `#TR-${Math.floor(Math.random() * 100000)}`,
               entity: customerName,
@@ -495,31 +615,52 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
               amount: `+ ₹${totalAmount.toFixed(2)}`,
               amountColor: 'text-tertiary'
             };
-            const transactionsRef = collection(db, `users/${auth.currentUser.uid}/transactions`);
-            await setDoc(doc(transactionsRef), newTransaction);
-            
-            // 📉 Update Inventory Stock atomically
-            const batch = writeBatch(db);
-            for (const item of selectedItems) {
-              const itemRef = doc(db, `users/${auth.currentUser.uid}/inventory/${item.id}`);
-              
-              // We'll update the stock using increment for atomicity
-              // and status based on the current known stock minus order quantity
-              const estNewStock = Math.max(0, (item.stock || 0) - (item.quantity || 1));
-              const newStatus = estNewStock < 20 ? 'error' : 'tertiary';
-              
-              batch.update(itemRef, { 
-                stock: increment(-(item.quantity || 1)),
-                status: newStatus
-              });
-            }
-            await batch.commit();
+
+            await runTransaction(db, async (transaction) => {
+              for (const item of selectedItems) {
+                const itemRef = doc(db, `users/${auth.currentUser.uid}/inventory/${item.id}`);
+                const inventorySnapshot = await transaction.get(itemRef);
+
+                if (!inventorySnapshot.exists()) {
+                  throw new Error(`Product "${item.name}" is no longer available in inventory.`);
+                }
+
+                const currentStock = getAvailableStock(inventorySnapshot.data());
+                const requestedQuantity = Math.max(1, Number(item.quantity) || 1);
+
+                if (requestedQuantity > currentStock) {
+                  throw new Error(
+                    `The specified product amount is not available for ${item.name}. Requested: ${requestedQuantity}, available: ${currentStock}.`
+                  );
+                }
+
+                const newStock = Math.max(0, currentStock - requestedQuantity);
+                const newStatus = newStock < 20 ? 'error' : 'tertiary';
+
+                transaction.update(itemRef, {
+                  stock: newStock,
+                  status: newStatus
+                });
+              }
+
+              transaction.set(orderRef, newOrder);
+              transaction.set(transactionRef, newTransaction);
+            });
 
             showToast('Order created successfully and stock updated', 'success');
             setIsQuickOrderModalOpen(false);
             setSelectedItems([]);
             setSearchQuery('');
           } catch (error) {
+            const isInventoryAvailabilityError = error instanceof Error
+              && (error.message.includes('not available') || error.message.includes('no longer available'));
+
+            if (isInventoryAvailabilityError && error instanceof Error) {
+              window.alert(error.message);
+              showToast(error.message, 'error');
+              return;
+            }
+
             handleFirestoreError(error, OperationType.CREATE, `users/${auth.currentUser.uid}/orders`);
             showToast('Failed to create order', 'error');
           }

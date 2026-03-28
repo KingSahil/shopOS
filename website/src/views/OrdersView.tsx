@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import TopBar from '../components/TopBar';
 import { useToast } from '../contexts/ToastContext';
 import { ViewState } from '../types';
-import { collection, onSnapshot, doc, deleteDoc, updateDoc, setDoc, writeBatch, increment } from 'firebase/firestore';
+import { collection, onSnapshot, doc, deleteDoc, updateDoc, runTransaction } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from '../firebase';
 import Modal from '../components/Modal';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -30,6 +30,12 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
   const [inventoryItems, setInventoryItems] = useState<any[]>([]);
   const [quickOrderSearchQuery, setQuickOrderSearchQuery] = useState('');
   const [selectedItems, setSelectedItems] = useState<any[]>([]);
+  const getAvailableStock = (item: any) => Math.max(0, Number(item?.stock) || 0);
+  const showInsufficientStockAlert = (itemName: string, requestedQuantity: number, availableStock: number) => {
+    window.alert(
+      `The specified product amount is not available for ${itemName}. Requested: ${requestedQuantity}, available: ${availableStock}.`
+    );
+  };
 
   const getStatusTone = (order: any) => {
     if (order.status === 'Delivered') {
@@ -169,8 +175,23 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
 
   const handleSelectItem = (item: any) => {
     const existingItem = selectedItems.find(i => i.id === item.id);
+    const availableStock = getAvailableStock(item);
+
+    if (availableStock <= 0) {
+      showInsufficientStockAlert(item.name, 1, availableStock);
+      showToast(`${item.name} is out of stock`, 'error');
+      return;
+    }
+
     if (existingItem) {
-      setSelectedItems(selectedItems.map(i => i.id === item.id ? { ...i, quantity: i.quantity + 1 } : i));
+      const nextQuantity = existingItem.quantity + 1;
+      if (nextQuantity > availableStock) {
+        showInsufficientStockAlert(item.name, nextQuantity, availableStock);
+        showToast(`Only ${availableStock} units of ${item.name} are available`, 'error');
+        return;
+      }
+
+      setSelectedItems(selectedItems.map(i => i.id === item.id ? { ...i, quantity: nextQuantity } : i));
     } else {
       setSelectedItems([...selectedItems, { ...item, quantity: 1 }]);
     }
@@ -184,7 +205,15 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
   const handleQuantityChange = (id: string, delta: number) => {
     setSelectedItems(selectedItems.map(i => {
       if (i.id === id) {
+        const availableStock = getAvailableStock(i);
         const newQuantity = Math.max(1, i.quantity + delta);
+
+        if (newQuantity > availableStock) {
+          showInsufficientStockAlert(i.name, newQuantity, availableStock);
+          showToast(`Only ${availableStock} units of ${i.name} are available`, 'error');
+          return i;
+        }
+
         return { ...i, quantity: newQuantity };
       }
       return i;
@@ -481,6 +510,11 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
             const customerName = formData.get('customerName') as string || 'Walk-in Customer';
             const customerPhone = formData.get('customerPhone') as string || 'N/A';
             
+            const ordersRef = collection(db, `users/${auth.currentUser.uid}/orders`);
+            const orderRef = doc(ordersRef);
+            const transactionsRef = collection(db, `users/${auth.currentUser.uid}/transactions`);
+            const transactionRef = doc(transactionsRef);
+
             const newOrder = {
               id: `#ORD-${Math.floor(Math.random() * 100000)}`,
               name: selectedItems.length === 1 ? selectedItems[0].name : `${selectedItems.length} Items`,
@@ -493,9 +527,6 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
               sColor: 'tertiary',
               items: selectedItems
             };
-
-            const ordersRef = collection(db, `users/${auth.currentUser.uid}/orders`);
-            await setDoc(doc(ordersRef), newOrder);
 
             const newTransaction = {
               id: `#TR-${Math.floor(Math.random() * 100000)}`,
@@ -511,27 +542,52 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
               amount: `+ ₹${totalAmount.toFixed(2)}`,
               amountColor: 'text-tertiary'
             };
-            const transactionsRef = collection(db, `users/${auth.currentUser.uid}/transactions`);
-            await setDoc(doc(transactionsRef), newTransaction);
-            
-            const batch = writeBatch(db);
-            for (const item of selectedItems) {
-              const itemRef = doc(db, `users/${auth.currentUser.uid}/inventory/${item.id}`);
-              const estNewStock = Math.max(0, (item.stock || 0) - (item.quantity || 1));
-              const newStatus = estNewStock < 20 ? 'error' : 'tertiary';
-              
-              batch.update(itemRef, { 
-                stock: increment(-(item.quantity || 1)),
-                status: newStatus
-              });
-            }
-            await batch.commit();
+
+            await runTransaction(db, async (transaction) => {
+              for (const item of selectedItems) {
+                const itemRef = doc(db, `users/${auth.currentUser.uid}/inventory/${item.id}`);
+                const inventorySnapshot = await transaction.get(itemRef);
+
+                if (!inventorySnapshot.exists()) {
+                  throw new Error(`Product "${item.name}" is no longer available in inventory.`);
+                }
+
+                const currentStock = getAvailableStock(inventorySnapshot.data());
+                const requestedQuantity = Math.max(1, Number(item.quantity) || 1);
+
+                if (requestedQuantity > currentStock) {
+                  throw new Error(
+                    `The specified product amount is not available for ${item.name}. Requested: ${requestedQuantity}, available: ${currentStock}.`
+                  );
+                }
+
+                const newStock = Math.max(0, currentStock - requestedQuantity);
+                const newStatus = newStock < 20 ? 'error' : 'tertiary';
+
+                transaction.update(itemRef, {
+                  stock: newStock,
+                  status: newStatus
+                });
+              }
+
+              transaction.set(orderRef, newOrder);
+              transaction.set(transactionRef, newTransaction);
+            });
 
             showToast('Order created successfully and stock updated', 'success');
             setIsQuickOrderModalOpen(false);
             setSelectedItems([]);
             setQuickOrderSearchQuery('');
           } catch (error) {
+            const isInventoryAvailabilityError = error instanceof Error
+              && (error.message.includes('not available') || error.message.includes('no longer available'));
+
+            if (isInventoryAvailabilityError && error instanceof Error) {
+              window.alert(error.message);
+              showToast(error.message, 'error');
+              return;
+            }
+
             handleFirestoreError(error, OperationType.CREATE, `users/${auth.currentUser.uid}/orders`);
             showToast('Failed to create order', 'error');
           }

@@ -16,8 +16,8 @@ import { processNaturalLanguage } from "./nlp/index.js";
 import Pino from "pino";
 import qrcode from "qrcode-terminal";
 import { normalizePhoneNumber, extractPhoneFromJid } from './utils.js';
-import { updateBotStatusInFirebase, db } from './firebase_client.js';
-import { onSnapshot, doc, collectionGroup, getDocs, updateDoc, deleteDoc, setDoc } from 'firebase/firestore';
+import { updateBotStatusInFirebase, db, resolveStoreUserId } from './firebase_client.js';
+import { onSnapshot, doc, updateDoc, deleteDoc, setDoc } from 'firebase/firestore';
 
 const logger = Pino();
 const AUTH_PATH = "./tokens/session-name";
@@ -346,10 +346,8 @@ async function start() {
   // 📡 Listen for remote commands (like logout/unlink)
   setTimeout(async () => {
     try {
-      const inventoryGroupRef = collectionGroup(db, 'inventory');
-      const inventorySnap = await getDocs(inventoryGroupRef);
-      if (!inventorySnap.empty) {
-        const userId = inventorySnap.docs[0].ref.path.split('/')[1];
+      const userId = await resolveStoreUserId();
+      if (userId) {
         const botStatusRef = doc(db, `users/${userId}/bot/status`);
         
         onSnapshot(botStatusRef, async (snapshot) => {
