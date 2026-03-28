@@ -1,0 +1,138 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "A user of the app",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "role": { "type": "string" }
+      },
+      "required": ["email", "role"]
+    },
+    "InventoryItem": {
+      "title": "Inventory Item",
+      "description": "An item in the store's inventory",
+      "type": "object",
+      "properties": {
+        "id": { "type": "number" },
+        "name": { "type": "string" },
+        "sku": { "type": "string" },
+        "category": { "type": "string" },
+        "stock": { "type": "number" },
+        "maxStock": { "type": "number" },
+        "price": { "type": "number" },
+        "unitPrice": { "type": "number" },
+        "status": { "type": "string" }
+      },
+      "required": ["name", "sku", "category", "stock", "maxStock", "price", "unitPrice", "status"]
+    },
+    "Order": {
+      "title": "Order",
+      "description": "A customer order",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "date": { "type": "string" },
+        "customer": { "type": "string" },
+        "initials": { "type": "string" },
+        "status": { "type": "string" },
+        "amount": { "type": "string" },
+        "sColor": { "type": "string" }
+      },
+      "required": ["id", "name", "date", "customer", "initials", "status", "amount", "sColor"]
+    },
+    "UdharCustomer": {
+      "title": "Udhar Customer",
+      "description": "A customer with pending credit",
+      "type": "object",
+      "properties": {
+        "initials": { "type": "string" },
+        "name": { "type": "string" },
+        "lastPayment": { "type": "string" },
+        "amount": { "type": "string" },
+        "bg": { "type": "string" },
+        "text": { "type": "string" }
+      },
+      "required": ["initials", "name", "lastPayment", "amount", "bg", "text"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "A financial transaction",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "entity": { "type": "string" },
+        "initials": { "type": "string" },
+        "bg": { "type": "string" },
+        "text": { "type": "string" },
+        "date": { "type": "string" },
+        "status": { "type": "string" },
+        "statusBg": { "type": "string" },
+        "statusText": { "type": "string" },
+        "amount": { "type": "string" },
+        "amountColor": { "type": "string" }
+      },
+      "required": ["id", "entity", "initials", "bg", "text", "date", "status", "statusBg", "statusText", "amount", "amountColor"]
+    },
+    "Insight": {
+      "title": "Insight",
+      "description": "A business insight",
+      "type": "object",
+      "properties": {
+        "cat": { "type": "string" },
+        "icon": { "type": "string" },
+        "current": { "type": "string" },
+        "forecast": { "type": "string" },
+        "conf": { "type": "number" },
+        "status": { "type": "string" },
+        "sColor": { "type": "string" }
+      },
+      "required": ["cat", "icon", "current", "forecast", "conf", "status", "sColor"]
+    },
+    "DashboardData": {
+      "title": "Dashboard Data",
+      "description": "Summary data for the dashboard",
+      "type": "object",
+      "properties": {
+        "revenue": { "type": "string" },
+        "revenueGrowth": { "type": "string" },
+        "pendingUdhar": { "type": "string" },
+        "smartAlert": { "type": "string" },
+        "profitOptimizer": { "type": "string" }
+      },
+      "required": ["revenue", "revenueGrowth", "pendingUdhar", "smartAlert", "profitOptimizer"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "User profile"
+    },
+    "/users/{userId}/inventory/{itemId}": {
+      "schema": { "$ref": "#/entities/InventoryItem" },
+      "description": "Store inventory items"
+    },
+    "/users/{userId}/orders/{orderId}": {
+      "schema": { "$ref": "#/entities/Order" },
+      "description": "Store orders"
+    },
+    "/users/{userId}/udhar/{customerId}": {
+      "schema": { "$ref": "#/entities/UdharCustomer" },
+      "description": "Udhar customers"
+    },
+    "/users/{userId}/transactions/{transactionId}": {
+      "schema": { "$ref": "#/entities/Transaction" },
+      "description": "Financial transactions"
+    },
+    "/users/{userId}/insights/{insightId}": {
+      "schema": { "$ref": "#/entities/Insight" },
+      "description": "Business insights"
+    },
+    "/users/{userId}/dashboard/main": {
+      "schema": { "$ref": "#/entities/DashboardData" },
+      "description": "Main dashboard summary data"
+    }
+  }
+}
