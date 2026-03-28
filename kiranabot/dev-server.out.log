@@ -2331,3 +2331,4 @@ Database initialized.
 ✅ [FIREBASE] Bot status updated!
 ⚠️ WhatsApp disconnected (reason=connectionReplaced, code=440).
 🎯 [FIREBASE] Using verified Merchant UID: 34vSO0JZsZPuXL6jlviszlzwe3Y2
+[31m[nodemon] app crashed - waiting for file changes before starting...[39m
