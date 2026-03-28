@@ -28,13 +28,14 @@ Fix:
 Check:
 
 - `FIREBASE_EMAIL` and `FIREBASE_PASSWORD` are valid
+- or set `FIREBASE_USER_ID` if you already know the merchant UID and want to bypass UID discovery
 - Firestore rules allow the configured account to read and write
 - the target merchant already has docs under `users/{uid}/inventory`
 
 Why inventory matters:
 
 - the bot resolves the merchant UID by querying the `inventory` collection group
-- if inventory is empty, the bot does not know which `users/{uid}` branch to use
+- if inventory is empty and `FIREBASE_USER_ID` is not set, the bot does not know which `users/{uid}` branch to use
 
 ## 4. The bot only shows fallback menu items
 
@@ -46,6 +47,7 @@ Fix:
 
 - confirm Firestore access
 - confirm `users/{uid}/inventory` contains documents
+- set `FIREBASE_USER_ID` when you want to pin the bot to a known merchant branch
 - check terminal logs from `src/menu.js` and `src/firebase_client.js`
 
 ## 5. AI ordering is not working

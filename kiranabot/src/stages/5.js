@@ -2,7 +2,7 @@ import { setState } from '../storage.js';
 import { stageOne } from './1.js';
 
 export const finalStage = {
-  async exec(params) {
+  exec(params) {
     const { from, state } = params;
     
     // Reset state to 1
@@ -12,6 +12,6 @@ export const finalStage = {
     setState(from, state);
 
     // Instantly process the message as a stage 1 request
-    return await stageOne.exec(params);
+    return stageOne.exec(params);
   },
 };

@@ -51,6 +51,9 @@ export function extractPhoneFromJid(jid) {
   if (domain === 'lid') {
     const resolved = resolveLid(cleanId);
     if (resolved) return resolved;
+    // If LID cannot be resolved, return the original LID JID part
+    // but don't normalize it as a phone number to avoid accidental matches
+    return `lid:${cleanId}`;
   }
   
   return normalizePhoneNumber(cleanId);

@@ -1,15 +1,47 @@
-import { menu, refreshMenuFromFirebase, formatMenuMessage } from '../menu.js';
+import { getMenu } from '../menu.js';
 import { setState } from '../storage.js';
 
 export const stageOne = {
   async exec({ from, message, client, state }) {
     const text = (message || '').toLowerCase().trim();
-
-    await refreshMenuFromFirebase();
+    const menu = await getMenu();
 
     // Check for "show me the menu" intent
     if (text === 'show me the menu' || text.includes('menu')) {
-      let msg = formatMenuMessage();
+      let msg = '🌟 *OUR CATALOG* 🌟\n';
+      msg += '━━━━━━━━━━━━━━━━\n\n';
+      
+      const inStock = [];
+      const outOfStock = [];
+
+      Object.keys(menu).forEach((key) => {
+        const item = menu[key];
+        if (Number(item.stock || 0) > 0) {
+          inStock.push(item);
+        } else {
+          outOfStock.push(item);
+        }
+      });
+
+      if (inStock.length > 0) {
+        msg += '🛒 *IN STOCK*\n';
+        inStock.forEach((item) => {
+          msg += `📦 *${item.description}*\n`;
+          msg += `💰 Price: ₹${item.price}\n`;
+          msg += `🔢 Quantity: ${item.stock} left\n\n`;
+        });
+      }
+
+      if (outOfStock.length > 0) {
+        msg += '━━━━━━━━━━━━━━━━\n';
+        msg += '🚫 *OUT OF STOCK*\n';
+        outOfStock.forEach((item) => {
+          msg += `📦 ~${item.description}~\n`;
+          msg += `💰 Price: ₹${item.price}\n\n`;
+        });
+      }
+      
+      msg += '━━━━━━━━━━━━━━━━\n';
       msg += 'Type the *item name* to start your order! 🚀';
       return msg;
     }
@@ -63,30 +95,20 @@ export const stageOne = {
       }
 
       if (matchedItem) {
-        const availableStock = Math.max(0, Number(matchedItem.stock) || 0);
-        if (availableStock <= 0) {
-          return `❌ *${matchedItem.description}* is currently out of stock.\n\nType *menu* to see what is available right now.`;
-        }
-
-        if (parsedQty > availableStock) {
-          return `❌ Only *${availableStock}* units of *${matchedItem.description}* are left in inventory.\n\nPlease send a smaller quantity.`;
-        }
-
         // Staging for confirmation
         state.pendingItem = matchedItem;
         state.pendingQuantity = parsedQty;
         state.stage = 2; 
         setState(from, state);
-        const qtyStr = parsedQty > 1 ? `${parsedQty}x ` : '';
-        const total = (matchedItem.price || 0) * parsedQty;
+        
+        const totalValue = matchedItem.price * parsedQty;
+        const qtyDisplay = parsedQty > 1 ? `${parsedQty}x ` : '';
 
         return `🛒 *CONFIRM ORDER* 🛒
 ━━━━━━━━━━━━━━━━
 
-📦 *Item:* ${qtyStr}${matchedItem.description}
-💰 *Price:* ₹${matchedItem.price}
-📊 *Left in stock:* ${availableStock}
-💵 *Total:* ₹${total}
+📦 *Item:* ${qtyDisplay}${matchedItem.description}
+💰 *Total Price:* ₹${totalValue}
 
 👉 Reply with *YES* to confirm or *NO* to cancel.`;
       } else {

@@ -1,16 +1,430 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { BrowserMultiFormatReader, type IScannerControls } from '@zxing/browser';
 import TopBar from '../components/TopBar';
 import { useToast } from '../contexts/ToastContext';
 import Modal from '../components/Modal';
-import { collection, onSnapshot, addDoc, query, orderBy, doc, updateDoc } from 'firebase/firestore';
+import { collection, onSnapshot, addDoc, query, orderBy, doc, updateDoc, deleteDoc } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from '../firebase';
+
+declare global {
+  interface Window {
+    BarcodeDetector?: {
+      new (options?: { formats?: string[] }): {
+        detect: (source: ImageBitmapSource) => Promise<Array<{ rawValue?: string }>>;
+      };
+      getSupportedFormats?: () => Promise<string[]>;
+    };
+  }
+}
+
+const DEFAULT_PRODUCT_FORM = {
+  name: '',
+  category: 'Essentials',
+  sku: '',
+  barcode: '',
+  unitPrice: '',
+  stock: '0'
+};
+
+type BarcodeLookupResult = {
+  barcode: string;
+  name: string;
+  brand: string;
+  quantity: string;
+  imageUrl: string;
+  unitPrice: number | null;
+  currency: string | null;
+  priceSource: string | null;
+};
+
+const BARCODE_LOOKUP_USER_AGENT = 'shopos/1.0 inventory-lookup';
+
+const extractRupeePrice = (...values: Array<string | null | undefined>) => {
+  const combinedValue = values
+    .map(value => String(value || ' '))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!combinedValue) return null;
+
+  const directMatch = combinedValue.match(/(?:₹|rs\.?|mrp\s*[:\-]?\s*)(\d+(?:\.\d{1,2})?)/i);
+  if (directMatch) {
+    return Number(directMatch[1]);
+  }
+
+  const compactMatch = combinedValue.match(/(\d+(?:\.\d{1,2})?)\s*(?:rs|rupees)\b/i);
+  if (compactMatch) {
+    return Number(compactMatch[1]);
+  }
+
+  const suffixMatch = combinedValue.match(/(\d+(?:\.\d{1,2})?)\s*(?:g|kg|ml|l|gm)\s*(\d+(?:\.\d{1,2})?)\s*(?:rs|rupees)\b/i);
+  if (suffixMatch) {
+    return Number(suffixMatch[2]);
+  }
+
+  return null;
+};
+
+const cleanProductTitle = (...values: Array<string | null | undefined>) => {
+  const combinedValue = values
+    .map(value => String(value || ' ').trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!combinedValue) return '';
+
+  return combinedValue
+    .replace(/\b\d+(?:\.\d+)?\s*(?:g|kg|gm|ml|l|ltr|litre|litres)\s*\d+(?:\.\d{1,2})?\s*(?:rs|rupees)\b/gi, ' ')
+    .replace(/\b\d+(?:\.\d+)?\s*(?:g|kg|gm|ml|l|ltr|litre|litres)\b/gi, ' ')
+    .replace(/(?:₹|rs\.?|mrp\s*[:\-]?\s*)\d+(?:\.\d{1,2})?/gi, ' ')
+    .replace(/\b\d+(?:\.\d{1,2})?\s*(?:rs|rupees)\b/gi, ' ')
+    .replace(/\bpack of \d+\b/gi, ' ')
+    .replace(/\b\d+\s*(?:pcs|pieces)\b/gi, ' ')
+    .replace(/[()]/g, ' ')
+    .replace(/[-,/:]+$/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+};
 
 export default function InventoryView() {
   const { showToast } = useToast();
   const [isAddProductOpen, setIsAddProductOpen] = useState(false);
   const [inventoryItems, setInventoryItems] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [productForm, setProductForm] = useState(DEFAULT_PRODUCT_FORM);
+  const [editingProduct, setEditingProduct] = useState<any | null>(null);
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [productToDelete, setProductToDelete] = useState<any | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [isScannerOpen, setIsScannerOpen] = useState(false);
+  const [isStartingScanner, setIsStartingScanner] = useState(false);
+  const [isLookingUpProduct, setIsLookingUpProduct] = useState(false);
+  const [scannerError, setScannerError] = useState('');
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const scannerStreamRef = useRef<MediaStream | null>(null);
+  const scannerFrameRef = useRef<number | null>(null);
+  const lastDetectedRef = useRef<{ code: string; detectedAt: number } | null>(null);
+  const scannerReaderRef = useRef<BrowserMultiFormatReader | null>(null);
+  const scannerControlsRef = useRef<IScannerControls | null>(null);
   const normalizeProductName = (value: unknown) => String(value ?? '').trim().toLowerCase();
+  const normalizeLookupValue = (value: unknown) => String(value ?? '').trim().toLowerCase();
+
+  const resetAddProductForm = () => {
+    setProductForm(DEFAULT_PRODUCT_FORM);
+    setScannerError('');
+  };
+
+  const stopScanner = () => {
+    scannerControlsRef.current?.stop();
+    scannerControlsRef.current = null;
+    scannerReaderRef.current = null;
+
+    if (scannerFrameRef.current) {
+      cancelAnimationFrame(scannerFrameRef.current);
+      scannerFrameRef.current = null;
+    }
+
+    if (scannerStreamRef.current) {
+      scannerStreamRef.current.getTracks().forEach(track => track.stop());
+      scannerStreamRef.current = null;
+    }
+
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.srcObject = null;
+    }
+
+    lastDetectedRef.current = null;
+  };
+
+  const closeAddProductModal = () => {
+    stopScanner();
+    setIsScannerOpen(false);
+    setIsAddProductOpen(false);
+    setEditingProduct(null);
+    resetAddProductForm();
+  };
+
+  const openAddProductModal = () => {
+    setEditingProduct(null);
+    setOpenMenuId(null);
+    setIsAddProductOpen(true);
+    resetAddProductForm();
+  };
+
+  const openEditProductModal = (item: any) => {
+    setEditingProduct(item);
+    setOpenMenuId(null);
+    stopScanner();
+    setIsScannerOpen(false);
+    setScannerError('');
+    setProductForm({
+      name: item.name ?? '',
+      category: item.category ?? DEFAULT_PRODUCT_FORM.category,
+      sku: item.sku ?? '',
+      barcode: item.barcode ?? '',
+      unitPrice: String(item.unitPrice ?? ''),
+      stock: String(item.stock ?? 0)
+    });
+    setIsAddProductOpen(true);
+  };
+
+  const findInventoryItemByCode = (rawCode: string) => {
+    const normalizedCode = normalizeLookupValue(rawCode);
+    if (!normalizedCode) return null;
+
+    return inventoryItems.find(item => {
+      const candidates = [item.barcode, item.sku, item.id];
+      return candidates.some(candidate => normalizeLookupValue(candidate) === normalizedCode);
+    }) || null;
+  };
+
+  const fetchBarcodeProductDetails = async (barcode: string) => {
+    const normalizedBarcode = String(barcode || '').trim();
+    if (!normalizedBarcode) return null;
+
+    setIsLookingUpProduct(true);
+
+    try {
+      let result: BarcodeLookupResult | null = null;
+
+      try {
+        const proxiedResponse = await fetch(`/api/barcode-lookup?code=${encodeURIComponent(normalizedBarcode)}`);
+        const proxiedContentType = proxiedResponse.headers.get('content-type') || '';
+
+        if (proxiedResponse.ok && proxiedContentType.includes('application/json')) {
+          result = await proxiedResponse.json() as BarcodeLookupResult;
+        }
+      } catch (proxyError) {
+        console.warn('Local barcode lookup endpoint unavailable, falling back to direct web lookup.', proxyError);
+      }
+
+      if (!result) {
+        const productResponse = await fetch(
+          `https://world.openfoodfacts.net/api/v2/product/${encodeURIComponent(normalizedBarcode)}?fields=product_name,product_name_en,product_name_hi,brands,quantity,image_front_url`,
+          {
+            headers: {
+              'User-Agent': BARCODE_LOOKUP_USER_AGENT
+            }
+          }
+        );
+
+        if (!productResponse.ok) {
+          throw new Error(`Lookup failed with status ${productResponse.status}`);
+        }
+
+        const productPayload = await productResponse.json();
+        const product = productPayload?.product ?? {};
+
+        result = {
+          barcode: normalizedBarcode,
+          name: String(product.product_name_hi || product.product_name_en || product.product_name || '').trim(),
+          brand: String(product.brands || '').trim(),
+          quantity: String(product.quantity || '').trim(),
+          imageUrl: String(product.image_front_url || '').trim(),
+          unitPrice: null,
+          currency: null,
+          priceSource: null
+        };
+      }
+
+      setProductForm(currentForm => {
+        const rawResolvedName = result.name || currentForm.name;
+        const cleanedName = cleanProductTitle(rawResolvedName);
+        const cleanedBrand = cleanProductTitle(result.brand);
+        const cleanedQuantity = cleanProductTitle(result.quantity);
+        const resolvedNameWithBrand = [cleanedBrand, cleanedName].filter(Boolean).join(' ').trim() || currentForm.name;
+        const resolvedDisplayName = cleanProductTitle(resolvedNameWithBrand, cleanedQuantity) || resolvedNameWithBrand;
+        const parsedRupeePrice = extractRupeePrice(result.name, result.quantity, resolvedDisplayName);
+        const resolvedUnitPrice = result.currency === 'INR' && result.unitPrice != null
+          ? String(result.unitPrice)
+          : currentForm.unitPrice || (parsedRupeePrice != null ? String(parsedRupeePrice) : '');
+
+        return {
+          ...currentForm,
+          barcode: normalizedBarcode,
+          sku: currentForm.sku || normalizedBarcode,
+          name: currentForm.name || resolvedDisplayName,
+          unitPrice: currentForm.unitPrice || resolvedUnitPrice,
+          stock: currentForm.stock === '0' ? '1' : currentForm.stock
+        };
+      });
+
+      if (result.name && result.currency === 'INR' && result.unitPrice != null) {
+        setScannerError(`Fetched ${result.name} and filled unit price from ${result.priceSource}.`);
+        showToast(`${result.name} found with MRP ₹${result.unitPrice}`, 'success');
+      } else if (result.name) {
+        const cleanedResultName = cleanProductTitle(result.brand, result.name);
+        const parsedRupeePrice = extractRupeePrice(result.name, result.quantity, cleanedResultName);
+
+        if (parsedRupeePrice != null) {
+          setScannerError(`Fetched ${cleanedResultName || result.name} and detected ₹${parsedRupeePrice} from the product title.`);
+          showToast(`${cleanedResultName || result.name} found with detected MRP ₹${parsedRupeePrice}`, 'success');
+          return result;
+        }
+
+        setScannerError(`Fetched ${cleanedResultName || result.name}. Please confirm the MRP because no INR price was available online.`);
+        showToast(`Fetched ${cleanedResultName || result.name}. Add the MRP manually if needed.`, 'info');
+      } else {
+        setScannerError(`Barcode ${normalizedBarcode} is new. Add the product details below to save it to inventory.`);
+        showToast(`Barcode ${normalizedBarcode} captured for a new product`, 'info');
+      }
+
+      return result;
+    } catch (error) {
+      console.error('Error fetching product details from barcode:', error);
+      setProductForm(currentForm => ({
+        ...currentForm,
+        barcode: normalizedBarcode,
+        sku: currentForm.sku || normalizedBarcode,
+        stock: currentForm.stock === '0' ? '1' : currentForm.stock
+      }));
+      setScannerError(`Could not fetch product details for barcode ${normalizedBarcode}. Add the product name and MRP manually.`);
+      showToast('Barcode captured, but online details were unavailable', 'info');
+      return null;
+    } finally {
+      setIsLookingUpProduct(false);
+    }
+  };
+
+  const restockInventoryItem = async (item: any, scannedCode: string) => {
+    if (!auth.currentUser) return;
+
+    const currentStock = Math.max(0, Number(item.stock) || 0);
+    const updatedStock = currentStock + 1;
+    const nextUnitPrice = Number(item.unitPrice) || 0;
+    const resolvedBarcode = normalizeLookupValue(item.barcode) ? item.barcode : scannedCode;
+
+    await updateDoc(doc(db, `users/${auth.currentUser.uid}/inventory/${item.id}`), {
+      barcode: resolvedBarcode,
+      stock: updatedStock,
+      price: nextUnitPrice * updatedStock,
+      maxStock: Math.max(Number(item.maxStock) || 0, updatedStock, updatedStock * 2, 100),
+      status: updatedStock < 20 ? 'error' : 'tertiary'
+    });
+
+    showToast(`${item.name} stock increased to ${updatedStock}`, 'success');
+  };
+
+  const startInventoryScanner = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setScannerError('Camera access is not available on this device. You can still use a hardware scanner or type the SKU/barcode.');
+      showToast('Camera access is not available on this device', 'error');
+      return;
+    }
+
+    try {
+      stopScanner();
+      setScannerError('');
+      setIsScannerOpen(true);
+      setIsStartingScanner(true);
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: 'environment' }
+        },
+        audio: false
+      });
+
+      scannerStreamRef.current = stream;
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+
+      const processDetectedCode = async (rawCode: string) => {
+        const normalizedCode = normalizeLookupValue(rawCode);
+        const now = Date.now();
+        const lastDetected = lastDetectedRef.current;
+
+        if (lastDetected && lastDetected.code === normalizedCode && now - lastDetected.detectedAt <= 2500) {
+          return;
+        }
+
+        lastDetectedRef.current = { code: normalizedCode, detectedAt: now };
+
+        const matchedItem = findInventoryItemByCode(rawCode);
+        if (matchedItem) {
+          try {
+            await restockInventoryItem(matchedItem, rawCode);
+        setProductForm(currentForm => ({
+          ...currentForm,
+          barcode: rawCode,
+          sku: currentForm.sku || rawCode
+            }));
+            setScannerError('');
+          } catch (error) {
+            console.error('Error updating inventory from scan:', error);
+            setScannerError(`Unable to update ${matchedItem.name} from barcode scan right now.`);
+            showToast('Failed to update scanned product stock', 'error');
+          }
+          return;
+        }
+
+        await fetchBarcodeProductDetails(rawCode);
+      };
+
+      if (window.BarcodeDetector) {
+        const detector = new window.BarcodeDetector({
+          formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'codabar']
+        });
+
+        const scanFrame = async () => {
+          if (!videoRef.current) return;
+
+          try {
+            const detectedBarcodes = await detector.detect(videoRef.current);
+            const rawCode = detectedBarcodes[0]?.rawValue;
+
+            if (rawCode) {
+              await processDetectedCode(rawCode);
+            }
+          } catch (error) {
+            console.error('Inventory barcode scan failed:', error);
+          }
+
+          scannerFrameRef.current = requestAnimationFrame(scanFrame);
+        };
+
+        scannerFrameRef.current = requestAnimationFrame(scanFrame);
+      } else {
+        const reader = new BrowserMultiFormatReader();
+        scannerReaderRef.current = reader;
+        scannerControlsRef.current = await reader.decodeFromConstraints(
+          {
+            video: {
+              facingMode: { ideal: 'environment' }
+            },
+            audio: false
+          },
+          videoRef.current ?? undefined,
+          (result, error) => {
+            if (result?.getText()) {
+              void processDetectedCode(result.getText());
+              return;
+            }
+
+            if (error && error.name !== 'NotFoundException') {
+              console.error('Inventory compatibility barcode scan failed:', error);
+            }
+          }
+        );
+        showToast('Compatibility barcode scanner started', 'info');
+      }
+    } catch (error) {
+      console.error('Error starting inventory barcode scanner:', error);
+      setIsScannerOpen(false);
+      setScannerError('Camera access was blocked. Allow camera permission to scan product barcodes.');
+      showToast('Unable to start barcode scanner', 'error');
+      stopScanner();
+    } finally {
+      setIsStartingScanner(false);
+    }
+  };
 
   useEffect(() => {
     if (!auth.currentUser) return;
@@ -64,26 +478,50 @@ export default function InventoryView() {
     return () => unsubscribe();
   }, []);
 
-  const handleAddProduct = async (e: React.FormEvent) => {
+  useEffect(() => {
+    if (!isAddProductOpen) {
+      stopScanner();
+      setIsScannerOpen(false);
+      setScannerError('');
+    }
+  }, [isAddProductOpen]);
+
+  useEffect(() => () => stopScanner(), []);
+
+  useEffect(() => {
+    if (!openMenuId) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('[data-inventory-actions="true"]')) {
+        return;
+      }
+      setOpenMenuId(null);
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    return () => document.removeEventListener('mousedown', handlePointerDown);
+  }, [openMenuId]);
+
+  const handleSaveProduct = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!auth.currentUser) return;
-    
-    const form = e.target as HTMLFormElement;
-    const formData = new FormData(form);
-    
-    const stock = Number(formData.get('stock'));
-    const unitPrice = Number(formData.get('unitPrice'));
+
+    const stock = Math.max(0, Number(productForm.stock));
+    const unitPrice = Math.max(0, Number(productForm.unitPrice));
     const price = unitPrice * stock;
     const maxStock = Math.max(100, stock * 2);
-    const sku = (formData.get('sku') as string) || `SKU-${Math.floor(Math.random() * 10000)}`;
-    const name = (formData.get('name') as string || '').trim();
+    const sku = productForm.sku.trim() || `SKU-${Math.floor(Math.random() * 10000)}`;
+    const barcode = productForm.barcode.trim();
+    const name = productForm.name.trim();
     const normalizedName = normalizeProductName(name);
-    
+
     const newItem = {
       id: Date.now(), // Using timestamp as numeric ID for schema compatibility
       name,
       sku,
-      category: formData.get('category') as string,
+      barcode,
+      category: productForm.category,
       stock,
       maxStock,
       price,
@@ -93,15 +531,34 @@ export default function InventoryView() {
 
     try {
       const inventoryRef = collection(db, `users/${auth.currentUser.uid}/inventory`);
-      const existingItem = inventoryItems.find(item => normalizeProductName(item.name) === normalizedName);
+      const existingItem = inventoryItems.find(item => {
+        if (editingProduct && item.id === editingProduct.id) {
+          return false;
+        }
+        return normalizeProductName(item.name) === normalizedName;
+      });
 
-      if (existingItem) {
+      if (editingProduct) {
+        await updateDoc(doc(db, `users/${auth.currentUser.uid}/inventory/${editingProduct.id}`), {
+          name,
+          sku,
+          barcode,
+          category: productForm.category,
+          stock,
+          unitPrice,
+          price,
+          maxStock,
+          status: stock < 20 ? 'error' : 'tertiary'
+        });
+        showToast('Product updated successfully', 'success');
+      } else if (existingItem) {
         const updatedStock = Math.max(0, Number(existingItem.stock) || 0) + stock;
         const updatedUnitPrice = unitPrice;
         await updateDoc(doc(db, `users/${auth.currentUser.uid}/inventory/${existingItem.id}`), {
           name,
           sku,
-          category: formData.get('category') as string,
+          barcode: barcode || existingItem.barcode || '',
+          category: productForm.category,
           stock: updatedStock,
           unitPrice: updatedUnitPrice,
           price: updatedUnitPrice * updatedStock,
@@ -114,11 +571,30 @@ export default function InventoryView() {
         showToast('Product added successfully', 'success');
       }
 
-      setIsAddProductOpen(false);
-      form.reset();
+      closeAddProductModal();
     } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, `users/${auth.currentUser.uid}/inventory`);
-      showToast('Failed to add product', 'error');
+      handleFirestoreError(
+        error,
+        editingProduct ? OperationType.UPDATE : OperationType.CREATE,
+        `users/${auth.currentUser.uid}/inventory`
+      );
+      showToast(editingProduct ? 'Failed to update product' : 'Failed to add product', 'error');
+    }
+  };
+
+  const handleDeleteProduct = async () => {
+    if (!auth.currentUser || !productToDelete) return;
+
+    setIsDeleting(true);
+    try {
+      await deleteDoc(doc(db, `users/${auth.currentUser.uid}/inventory`, productToDelete.id));
+      showToast(`${productToDelete.name} deleted successfully`, 'success');
+      setProductToDelete(null);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `users/${auth.currentUser.uid}/inventory`);
+      showToast('Failed to delete product', 'error');
+    } finally {
+      setIsDeleting(false);
     }
   };
 
@@ -169,7 +645,7 @@ export default function InventoryView() {
         <div className="flex flex-col sm:flex-row justify-between items-center gap-4 mb-8">
           <div className="flex gap-2 overflow-x-auto pb-2 sm:pb-0 w-full sm:w-auto no-scrollbar">
             <button 
-              onClick={() => setIsAddProductOpen(true)}
+              onClick={openAddProductModal}
               className="glass-gradient text-white px-6 py-3 rounded-full font-headline font-bold text-sm flex items-center gap-2 ambient-shadow active:scale-95 transition-transform whitespace-nowrap h-12"
             >
               <span className="material-symbols-outlined text-sm">add</span>
@@ -227,7 +703,7 @@ export default function InventoryView() {
               const stockRatio = item.maxStock > 0 ? Math.min(100, Math.max(0, (safeStock / item.maxStock) * 100)) : 0;
 
               return (
-              <div key={item.id || idx} className={`bg-surface-container-lowest p-5 rounded-[1.5rem] ghost-border flex flex-col md:grid md:grid-cols-12 gap-4 items-center hover:bg-surface-bright transition-all ambient-shadow relative overflow-hidden group`}>
+              <div key={item.id || idx} className={`bg-surface-container-lowest p-5 rounded-[1.5rem] ghost-border flex flex-col md:grid md:grid-cols-12 gap-4 items-center hover:bg-surface-bright transition-all ambient-shadow relative group`}>
                 {item.status === 'error' && <div className="absolute left-0 top-0 h-full w-1.5 bg-error"></div>}
                 
                 <div className="col-span-5 flex items-center gap-4 w-full">
@@ -256,13 +732,37 @@ export default function InventoryView() {
                   <p className="text-[10px] text-outline">Unit: ₹{item.unitPrice.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
                 </div>
                 
-                <div className="col-span-1 flex justify-end w-full">
+                <div className="col-span-1 flex justify-end w-full relative" data-inventory-actions="true">
                   <button 
-                    onClick={() => showToast(`Options for ${item.name}`, 'info')}
+                    onClick={() => setOpenMenuId(currentId => currentId === item.id ? null : item.id)}
                     className="w-10 h-10 flex items-center justify-center text-outline hover:text-secondary hover:bg-secondary/10 rounded-full transition-all"
+                    aria-label={`Open actions for ${item.name}`}
                   >
                     <span className="material-symbols-outlined">more_vert</span>
                   </button>
+                  {openMenuId === item.id && (
+                    <div className="absolute right-0 top-12 z-20 min-w-[11rem] rounded-2xl border border-outline-variant/20 bg-surface-container-lowest shadow-xl p-2">
+                      <button
+                        type="button"
+                        onClick={() => openEditProductModal(item)}
+                        className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-on-surface hover:bg-surface-container-highest transition-colors"
+                      >
+                        <span className="material-symbols-outlined text-[18px]">edit</span>
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setOpenMenuId(null);
+                          setProductToDelete(item);
+                        }}
+                        className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-error hover:bg-error/10 transition-colors"
+                      >
+                        <span className="material-symbols-outlined text-[18px]">delete</span>
+                        Delete
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             )})
@@ -304,16 +804,67 @@ export default function InventoryView() {
 
       <Modal
         isOpen={isAddProductOpen}
-        onClose={() => setIsAddProductOpen(false)}
-        title="Add New Product"
+        onClose={closeAddProductModal}
+        title={editingProduct ? 'Edit Product' : 'Add New Product'}
       >
-        <form className="space-y-5" onSubmit={handleAddProduct}>
+        <form className="space-y-5" onSubmit={handleSaveProduct}>
+          <div>
+            <label className="block text-sm font-bold text-on-surface mb-1">Scan Product Barcode</label>
+            <div className="flex flex-col gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  if (isScannerOpen) {
+                    stopScanner();
+                    setIsScannerOpen(false);
+                    setScannerError('');
+                  } else {
+                    void startInventoryScanner();
+                  }
+                }}
+                className={`h-12 px-4 rounded-full font-bold text-sm flex items-center justify-center gap-2 transition-colors whitespace-nowrap ${
+                  isScannerOpen
+                    ? 'bg-error/10 text-error border border-error/20'
+                    : 'bg-secondary text-white hover:opacity-90'
+                }`}
+              >
+                <span className="material-symbols-outlined text-[20px]">{isScannerOpen ? 'stop_circle' : 'qr_code_scanner'}</span>
+                {isStartingScanner ? 'Starting...' : isScannerOpen ? 'Stop Scan' : 'Scan Product'}
+              </button>
+              {isScannerOpen && (
+                <div className="rounded-[1rem] overflow-hidden border border-outline-variant/20 bg-surface-container-highest">
+                  <div className="aspect-[4/3] bg-on-surface/90 relative">
+                    <video
+                      ref={videoRef}
+                      className="w-full h-full object-cover"
+                      autoPlay
+                      muted
+                      playsInline
+                    />
+                    <div className="absolute inset-x-6 top-1/2 -translate-y-1/2 border-2 border-dashed border-secondary rounded-2xl h-28 pointer-events-none"></div>
+                    <div className="absolute left-4 right-4 bottom-4 text-center text-white text-xs font-bold tracking-wide">
+                      Scan the same barcode again anytime to increase that product&apos;s stock by 1
+                    </div>
+                  </div>
+                </div>
+              )}
+              {scannerError && (
+                <p className="text-xs text-error font-medium">{scannerError}</p>
+              )}
+              {isLookingUpProduct && (
+                <p className="text-xs text-secondary font-medium">Fetching product name and online MRP from the barcode...</p>
+              )}
+            </div>
+          </div>
+
           <div>
             <label className="block text-sm font-bold text-on-surface mb-1">Product Name</label>
             <input 
               type="text" 
               name="name"
               required
+              value={productForm.name}
+              onChange={(e) => setProductForm(currentForm => ({ ...currentForm, name: e.target.value }))}
               placeholder="e.g. Aashirvaad Atta (5kg)"
               className="w-full px-4 py-3 bg-surface-container-highest border-none rounded-sm focus:ring-1 focus:ring-secondary font-body text-sm outline-none transition-shadow"
             />
@@ -322,7 +873,12 @@ export default function InventoryView() {
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-bold text-on-surface mb-1">Category</label>
-              <select name="category" className="w-full px-4 py-3 bg-surface-container-highest border-none rounded-sm focus:ring-1 focus:ring-secondary font-body text-sm outline-none transition-shadow appearance-none">
+              <select
+                name="category"
+                value={productForm.category}
+                onChange={(e) => setProductForm(currentForm => ({ ...currentForm, category: e.target.value }))}
+                className="w-full px-4 py-3 bg-surface-container-highest border-none rounded-sm focus:ring-1 focus:ring-secondary font-body text-sm outline-none transition-shadow appearance-none"
+              >
                 <option>Essentials</option>
                 <option>Grains</option>
                 <option>Dairy</option>
@@ -334,9 +890,33 @@ export default function InventoryView() {
               <input 
                 type="text" 
                 name="sku"
+                value={productForm.sku}
+                onChange={(e) => setProductForm(currentForm => ({ ...currentForm, sku: e.target.value }))}
                 placeholder="Auto-generated"
                 className="w-full px-4 py-3 bg-surface-container-highest border-none rounded-sm focus:ring-1 focus:ring-secondary font-body text-sm outline-none transition-shadow"
               />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-bold text-on-surface mb-1">Barcode</label>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                name="barcode"
+                value={productForm.barcode}
+                onChange={(e) => setProductForm(currentForm => ({ ...currentForm, barcode: e.target.value }))}
+                placeholder="Scanned barcode appears here"
+                className="flex-1 px-4 py-3 bg-surface-container-highest border-none rounded-sm focus:ring-1 focus:ring-secondary font-body text-sm outline-none transition-shadow"
+              />
+              <button
+                type="button"
+                onClick={() => void fetchBarcodeProductDetails(productForm.barcode)}
+                disabled={isLookingUpProduct || !productForm.barcode.trim()}
+                className="px-4 py-3 rounded-full bg-secondary text-white text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isLookingUpProduct ? 'Fetching...' : 'Fetch'}
+              </button>
             </div>
           </div>
 
@@ -349,6 +929,8 @@ export default function InventoryView() {
                 required
                 min="0"
                 step="0.01"
+                value={productForm.unitPrice}
+                onChange={(e) => setProductForm(currentForm => ({ ...currentForm, unitPrice: e.target.value }))}
                 placeholder="0.00"
                 className="w-full px-4 py-3 bg-surface-container-highest border-none rounded-sm focus:ring-1 focus:ring-secondary font-body text-sm outline-none transition-shadow"
               />
@@ -360,6 +942,8 @@ export default function InventoryView() {
                 name="stock"
                 required
                 min="0"
+                value={productForm.stock}
+                onChange={(e) => setProductForm(currentForm => ({ ...currentForm, stock: e.target.value }))}
                 placeholder="0"
                 className="w-full px-4 py-3 bg-surface-container-highest border-none rounded-sm focus:ring-1 focus:ring-secondary font-body text-sm outline-none transition-shadow"
               />
@@ -369,7 +953,7 @@ export default function InventoryView() {
           <div className="pt-4 flex gap-3">
             <button 
               type="button"
-              onClick={() => setIsAddProductOpen(false)}
+              onClick={closeAddProductModal}
               className="flex-1 py-3 rounded-full bg-surface-container-highest text-on-surface font-bold text-sm hover:bg-outline-variant/30 transition-colors"
             >
               Cancel
@@ -378,10 +962,50 @@ export default function InventoryView() {
               type="submit"
               className="flex-1 py-3 rounded-full glass-gradient text-white font-bold text-sm hover:opacity-90 transition-opacity"
             >
-              Save Product
+              {editingProduct ? 'Update Product' : 'Save Product'}
             </button>
           </div>
         </form>
+      </Modal>
+
+      <Modal
+        isOpen={!!productToDelete}
+        onClose={() => {
+          if (!isDeleting) {
+            setProductToDelete(null);
+          }
+        }}
+        title="Delete Product"
+      >
+        <div className="flex flex-col gap-6">
+          <p className="text-on-surface-variant font-body leading-relaxed">
+            Are you sure you want to delete <span className="font-bold text-on-surface">{productToDelete?.name}</span>?
+            This action cannot be undone.
+          </p>
+          <div className="flex justify-end gap-3">
+            <button
+              type="button"
+              onClick={() => setProductToDelete(null)}
+              disabled={isDeleting}
+              className="px-6 py-3 rounded-full bg-surface-container text-sm font-bold hover:bg-surface-container-highest transition-colors h-12 min-w-[100px]"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleDeleteProduct}
+              disabled={isDeleting}
+              className="px-6 py-3 rounded-full bg-error text-white text-sm font-bold hover:opacity-90 transition-all h-12 min-w-[100px] flex items-center justify-center gap-2"
+            >
+              {isDeleting ? (
+                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+              ) : (
+                <span className="material-symbols-outlined text-[18px]">delete</span>
+              )}
+              {isDeleting ? 'Deleting...' : 'Delete'}
+            </button>
+          </div>
+        </div>
       </Modal>
     </>
   );

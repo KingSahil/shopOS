@@ -2,6 +2,80 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 
+const LOOKUP_USER_AGENT = "shopos/1.0 barcode-lookup";
+
+type BarcodeLookupResult = {
+  barcode: string;
+  name: string;
+  brand: string;
+  quantity: string;
+  imageUrl: string;
+  unitPrice: number | null;
+  currency: string | null;
+  priceSource: string | null;
+};
+
+async function fetchProductDetails(code: string) {
+  const response = await fetch(
+    `https://world.openfoodfacts.net/api/v2/product/${encodeURIComponent(code)}?fields=product_name,product_name_en,product_name_hi,brands,quantity,image_front_url`,
+    {
+      headers: {
+        "User-Agent": LOOKUP_USER_AGENT
+      }
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Product lookup failed with status ${response.status}`);
+  }
+
+  const payload = await response.json();
+  const product = payload?.product ?? {};
+
+  return {
+    name: String(product.product_name_hi || product.product_name_en || product.product_name || "").trim(),
+    brand: String(product.brands || "").trim(),
+    quantity: String(product.quantity || "").trim(),
+    imageUrl: String(product.image_front_url || "").trim()
+  };
+}
+
+async function fetchProductPrice(code: string) {
+  const response = await fetch(
+    `https://prices.openfoodfacts.org/api/v1/prices?product_code=${encodeURIComponent(code)}`,
+    {
+      headers: {
+        "User-Agent": LOOKUP_USER_AGENT
+      }
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Price lookup failed with status ${response.status}`);
+  }
+
+  const payload = await response.json();
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+
+  const inrPrice =
+    items.find((item: any) => String(item?.currency || "").toUpperCase() === "INR" && Number.isFinite(Number(item?.price)))
+    || items.find((item: any) => String(item?.location?.osm_address_country_code || "").toUpperCase() === "IN" && Number.isFinite(Number(item?.price)));
+
+  if (!inrPrice) {
+    return {
+      unitPrice: null,
+      currency: null,
+      priceSource: null
+    };
+  }
+
+  return {
+    unitPrice: Number(inrPrice.price),
+    currency: String(inrPrice.currency || "").toUpperCase() || null,
+    priceSource: "Open Prices"
+  };
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -10,17 +84,23 @@ async function startServer() {
 
   // Demo inventory data
   let inventoryItems = [
-    { id: 1, name: 'Dhara Mustard Oil (1L)', sku: 'OIL-DH-1029', category: 'Essentials', stock: 14, maxStock: 100, price: 2450, unitPrice: 175, status: 'error' },
-    { id: 2, name: 'Fortune Basmati Rice (5kg)', sku: 'RIC-FO-502', category: 'Grains', stock: 142, maxStock: 200, price: 78100, unitPrice: 550, status: 'tertiary' },
+    { id: 1, name: 'Dhara Mustard Oil (1L)', sku: 'OIL-DH-1029', category: 'Essentials', stock: 13, maxStock: 100, price: 2275, unitPrice: 175, status: 'error' },
+    { id: 2, name: 'Fortune Basmati Rice (5kg)', sku: 'RIC-FO-502', category: 'Grains', stock: 147, maxStock: 200, price: 80850, unitPrice: 550, status: 'tertiary' },
     { id: 3, name: 'Amul Taaza Milk (1L)', sku: 'DAI-AM-100', category: 'Dairy', stock: 88, maxStock: 150, price: 5632, unitPrice: 64, status: 'tertiary' },
     { id: 4, name: "McVitie's Digestive (250g)", sku: 'SNK-MC-250', category: 'Snacks', stock: 3, maxStock: 50, price: 225, unitPrice: 75, status: 'error' },
+    { id: 5, name: "atta maggi", sku: 'SKU-6825', category: 'Essentials', stock: 52, maxStock: 100, price: 520, unitPrice: 10, status: 'tertiary' },
   ];
 
+  // Demo orders data
   let orders = [
-    { id: '#ORD-88219', name: 'Premium Tea Batch', date: 'Oct 24, 2023', customer: 'Amit Kirana', initials: 'AK', status: 'Delivered', amount: '12,450.00', sColor: 'tertiary' },
-    { id: '#ORD-88220', name: 'Bulk Flour Supply', date: 'Oct 25, 2023', customer: 'Raja Stores', initials: 'RS', status: 'Pending', amount: '45,200.00', sColor: 'secondary' },
-    { id: '#ORD-88221', name: 'Dairy Products', date: 'Oct 25, 2023', customer: 'Mehra Kirana', initials: 'MK', status: 'Cancelled', amount: '3,150.00', sColor: 'error' },
-    { id: '#ORD-88222', name: 'Edible Oils Cargo', date: 'Oct 26, 2023', customer: 'Hira Sweets', initials: 'HS', status: 'Delivered', amount: '89,000.00', sColor: 'tertiary' },
+    { id: '#ORD-18628', name: 'Dhara Mustard Oil (1L)', date: 'Mar 28, 2026', customer: 'https://www.lyshra.com/ (916283285856)', initials: 'HT', status: 'Delivered', amount: '175.00', sColor: 'tertiary' },
+    { id: '#ORD-34848', name: 'atta maggi', date: 'Mar 28, 2026', customer: 'Shashank (919779234350)', initials: 'SH', status: 'Paid', amount: '100.00', sColor: 'tertiary' },
+    { id: '#ORD-38100', name: 'atta maggi', date: 'Mar 28, 2026', customer: 'Shashank (919779234350)', initials: 'SH', status: 'Paid', amount: '10.00', sColor: 'tertiary' },
+    { id: '#ORD-94873', name: 'atta maggi', date: 'Mar 28, 2026', customer: 'Mr. Bhagat Singh', initials: 'MB', status: 'Delivered', amount: '90.00', sColor: 'tertiary' },
+    { id: '#ORD-43752', name: 'Amul Taaza Milk (1L)', date: 'Mar 27, 2026', customer: 'Sahil (918437867986)', initials: 'SA', status: 'Delivered', amount: '640.00', sColor: 'tertiary' },
+    { id: '#ORD-80228', name: "McVitie's Digestive (250g)", date: 'Mar 27, 2026', customer: 'Phone: +918437867986', initials: 'WA', status: 'Pending', amount: '75.00', sColor: 'secondary' },
+    { id: '#ORD-16644', name: 'atta maggi', date: 'Mar 27, 2026', customer: 'Sahil (918437867986)', initials: 'SA', status: 'Delivered', amount: '20.00', sColor: 'tertiary' },
+    { id: '#ORD-84916', name: 'atta maggi', date: 'Mar 27, 2026', customer: 'Sahil (918437867986)', initials: 'SA', status: 'Pending', amount: '60.00', sColor: 'secondary' },
   ];
 
   let udharCustomers = [
@@ -61,6 +141,50 @@ async function startServer() {
 
   app.get("/api/inventory", (req, res) => {
     res.json(inventoryItems);
+  });
+
+  app.get("/api/barcode-lookup", async (req, res) => {
+    const code = String(req.query.code || "").trim();
+
+    if (!/^\d{8,14}$/.test(code)) {
+      res.status(400).json({ error: "A valid barcode is required." });
+      return;
+    }
+
+    try {
+      const [product, pricing] = await Promise.allSettled([
+        fetchProductDetails(code),
+        fetchProductPrice(code)
+      ]);
+
+      const productValue = product.status === "fulfilled" ? product.value : {
+        name: "",
+        brand: "",
+        quantity: "",
+        imageUrl: ""
+      };
+      const priceValue = pricing.status === "fulfilled" ? pricing.value : {
+        unitPrice: null,
+        currency: null,
+        priceSource: null
+      };
+
+      const result: BarcodeLookupResult = {
+        barcode: code,
+        name: productValue.name,
+        brand: productValue.brand,
+        quantity: productValue.quantity,
+        imageUrl: productValue.imageUrl,
+        unitPrice: priceValue.unitPrice,
+        currency: priceValue.currency,
+        priceSource: priceValue.priceSource
+      };
+
+      res.json(result);
+    } catch (error) {
+      console.error("Barcode lookup failed:", error);
+      res.status(502).json({ error: "Unable to fetch product details right now." });
+    }
   });
 
   app.post("/api/inventory", (req, res) => {

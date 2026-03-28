@@ -1,8 +1,8 @@
 import { parseNaturalLanguageOrder, parseAdminQuery, isLLMConfigured } from './groq.js';
-import { buildCart, generateOrderSummary, generateNextStepPrompt, shouldAttemptNLParsing } from './parser.js';
-import { menu, refreshMenuFromFirebase, formatMenuMessage } from '../menu.js';
+import { shouldAttemptNLParsing } from './parser.js';
+import { getMenu } from '../menu.js';
 import { setState } from '../storage.js';
-import { saveOrderToFirebase, cancelLastOrderFromFirebase, fetchAdminSummaryData, validateInventoryAvailability } from '../firebase_client.js';
+import { saveOrderToFirebase, cancelLastOrderFromFirebase, fetchAdminSummaryData } from '../firebase_client.js';
 import { extractPhoneFromJid } from '../utils.js';
 
 /**
@@ -53,6 +53,7 @@ export class NLOrderProcessor {
 
     try {
       const history = state.history || [];
+      const menu = await getMenu();
 
       // Helper to update history and state
       const finishWithHistory = (botResponse) => {
@@ -70,23 +71,7 @@ export class NLOrderProcessor {
         };
       };
 
-      // --- 👑 ADMIN (SHOPKEEPER) FLOW ---
-      if (isAdmin) {
-        console.log('👷 Admin context detected, preparing business insights...');
-        const storeData = await fetchAdminSummaryData();
-        const adminResponse = await parseAdminQuery(message, storeData);
-        
-        if (adminResponse) {
-          return finishWithHistory(adminResponse);
-        }
-        
-        // If no response from AI for admin, we just allow it to fall through 
-        // which might reach stages, but we prefer admins stay in AI mode.
-        return finishWithHistory("Sorry, I'm having trouble retrieving your business data right now. Please check if your website is synced.");
-      }
-
       // --- 🛒 CUSTOMER FLOW ---
-      await refreshMenuFromFirebase();
       
       // 🔥 PRE-FILTER: Only attempt NL parsing if the message looks like an order
       // This prevents "yes", "no", etc. from being intercepted by AI
@@ -116,8 +101,40 @@ export class NLOrderProcessor {
       // --- HANDLE SHOW MENU INTENT ---
       if (parsedOrder.intent === 'show_menu') {
         let msg = parsedOrder.response ? `${parsedOrder.response}\n\n` : '';
-        msg += formatMenuMessage();
-        
+        msg += '🌟 *OUR CATALOG* 🌟\n';
+        msg += '━━━━━━━━━━━━━━━━\n\n';
+
+        const inStock = [];
+        const outOfStock = [];
+
+        Object.keys(menu).forEach((key) => {
+          const item = menu[key];
+          if (Number(item.stock || 0) > 0) {
+            inStock.push(item);
+          } else {
+            outOfStock.push(item);
+          }
+        });
+
+        if (inStock.length > 0) {
+          msg += '🛒 *IN STOCK*\n';
+          inStock.forEach((item) => {
+            msg += `📦 *${item.description}*\n`;
+            msg += `💰 Price: ₹${item.price}\n`;
+            msg += `🔢 Quantity: ${item.stock} left\n\n`;
+          });
+        }
+
+        if (outOfStock.length > 0) {
+          msg += '━━━━━━━━━━━━━━━━\n';
+          msg += '🚫 *OUT OF STOCK*\n';
+          outOfStock.forEach((item) => {
+            msg += `📦 ~${item.description}~\n`;
+            msg += `💰 Price: ₹${item.price}\n\n`;
+          });
+        }
+
+        msg += '━━━━━━━━━━━━━━━━\n';
         return finishWithHistory(msg);
       }
       if (parsedOrder.intent === 'confirm_order') {
@@ -185,25 +202,6 @@ export class NLOrderProcessor {
         return null;
       }
 
-      const availableStock = Math.max(0, Number(menuMatchedItem.stock) || 0);
-      if (availableStock <= 0) {
-        return finishWithHistory(`❌ *${menuMatchedItem.description}* is currently out of stock.\n\nType *menu* to see the latest inventory.`);
-      }
-
-      if (quantity > availableStock) {
-        return finishWithHistory(`❌ Only *${availableStock}* units of *${menuMatchedItem.description}* are left in inventory.\n\nPlease send a smaller quantity.`);
-      }
-
-      const availability = await validateInventoryAvailability([{
-        id: menuMatchedItem.id,
-        description: menuMatchedItem.description,
-        quantity
-      }]);
-
-      if (!availability.ok) {
-        return finishWithHistory(`❌ ${availability.message}`);
-      }
-
       state.pendingItem = menuMatchedItem;
       state.pendingQuantity = quantity;
       state.stage = 2; 
@@ -215,7 +213,6 @@ export class NLOrderProcessor {
 ━━━━━━━━━━━━━━━━
 
 📦 *Item:* ${quantityStr}${menuMatchedItem.description}
-📊 *Left in stock:* ${availableStock}
 💰 *Total:* ₹${totalValue}
 
 👉 Reply *YES* to confirm or *NO* to cancel.`);

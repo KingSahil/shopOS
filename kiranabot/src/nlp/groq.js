@@ -133,22 +133,25 @@ ${menuDescription}
 
 YOUR TASK:
 1. Use 'create_order' if the user specifies ANY items from the menu or expresses intent to buy.
+   - Match item names to IDs using the PROVIDED MENU ONLY.
+   - "atta maggi" MUST match the ID for "atta maggi" in the menu.
    - Include quantity if mentioned (default 1).
-   - Match item names to IDs using the provided menu.
 2. Use 'confirm_last_order' (true/false) if the user is confirming or rejecting a previously mentioned order draft (e.g., "Kardo", "Confirm", "Yes", "No", "Nahi").
 3. Use 'not_an_order' for non-transactional messages:
    - intent "greeting": For "Hi", "Hello".
-   - intent "show_menu": If they ask for the menu/list.
+   - intent "show_menu": ONLY if they explicitly ask for the menu/list without naming a specific item to buy.
    - intent "cancel_order": If they want to cancel an existing record.
    - intent "other": For everything else.
 
 GUIDELINES:
+- CRITICAL: If the user says "I want [item]", "Send [item]", or "[item] kardo", treat it as 'create_order'.
+- DO NOT use 'show_menu' if a specific item name is mentioned in the message.
 - Be concise and professional. Use "Hinglish" sparingly and only for politeness (e.g., "Ji", "Theek hai").
 - DO NOT repeat back the order in a chatty way if you are calling a tool.
-- If an item is mentioned, prioritizing 'create_order' is MANDATORY.
 
 EXAMPLES:
-- "8 atta maggi packets" -> create_order (ID for Maggi, qty 8)
+- "I want atta maggi" -> create_order (ID for atta maggi, qty 1)
+- "8 atta maggi packets" -> create_order (ID for atta maggi, qty 8)
 - "Kardo" -> confirm_last_order(confirmation=true)
 - "Show menu" -> not_an_order(intent="show_menu", response="Certainly. Here is our current catalog:")`;
 
@@ -163,14 +166,18 @@ EXAMPLES:
       model: config.model,
       messages,
       tools,
-      tool_choice: 'required',
+      tool_choice: 'auto',
       temperature: 0.1,
     });
 
     const toolCall = response.choices[0]?.message?.tool_calls?.[0];
 
     if (!toolCall) {
-      return null;
+      // If no tool call, treat it as a normal message/other intent
+      return {
+        intent: 'other',
+        response: response.choices[0]?.message?.content || null,
+      };
     }
 
     const functionName = toolCall.function.name;

@@ -1,11 +1,11 @@
-import { menu } from '../menu.js';
-
 /**
  * Build cart items from parsed order
  * @param {object} parsedOrder - Order from Groq parser
+ * @param {object} menu - Current inventory menu
  * @returns {object} Cart with validated items and total
  */
-export function buildCart(parsedOrder) {
+export function buildCart(parsedOrder, menu) {
+  if (!menu) return { items: [], total: 0, invalidItems: [], address: parsedOrder.address };
   const cartItems = [];
   let total = 0;
   const invalidItems = [];
@@ -105,11 +105,7 @@ export function shouldAttemptNLParsing(message) {
     'deliver', 'delivery', 'buy', 'purchase',
     'yes', 'confirm', 'kardo', 'ha', 'haan', 'ji', 'theek', 'ok',
     'no', 'cancel', 'nahi', 'stop', 'mat', 'rehne',
-  ];
-
-  // Menu item keywords (from menu)
-  const menuKeywords = [
-    'milk', 'apple', 'sugar', 'onion', 'tomato',
+    'items', 'stock', 'available'
   ];
 
   const lowerMessage = message.toLowerCase();
@@ -117,15 +113,8 @@ export function shouldAttemptNLParsing(message) {
   // Check for order intent keywords
   const hasOrderIntent = orderKeywords.some(kw => lowerMessage.includes(kw));
   
-  // Check for ANY menu item description contained in the message (fuzzy match)
-  const hasMentionedItems = Object.values(menu).some(item => {
-    const desc = item.description.toLowerCase();
-    // Match if message contains item description or vice-versa
-    return lowerMessage.includes(desc) || desc.includes(lowerMessage);
-  });
-
   // If it has quantity patterns like "2 apples" or "two milk"
   const hasQuantityPattern = /\b(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+\w+/i.test(message);
 
-  return hasOrderIntent || hasMentionedItems || hasQuantityPattern;
+  return hasOrderIntent || hasQuantityPattern;
 }

@@ -38,7 +38,7 @@ export const stageFour = {
     }];
 
     // 💾 Save Order
-    const orderResult = await saveOrderToFirebase({
+    const orderSuccess = await saveOrderToFirebase({
       phone,
       items,
       totalAmount,
@@ -61,14 +61,14 @@ export const stageFour = {
     state.pendingQuantity = null;
     setState(from, state);
 
-    if (orderResult?.ok) {
+    if (orderSuccess) {
       if (isUdhar) {
         return `✅ Order confirmed, ${customerName}! ₹${totalAmount.toLocaleString('en-IN')} has been added to your *Udhaar* balance. You can pay later at the store.`;
       } else {
         return `✅ Order confirmed and *PAID*! Thank you, ${customerName}. We'll notify you when it's ready for pickup.`;
       }
     } else {
-      return `❌ ${orderResult?.message || 'There was an error finalizing your order. Please try again or visit the store.'}`;
+      return `❌ There was an error finalizing your order. Please try again or visit the store.`;
     }
   },
 };

@@ -16,13 +16,14 @@ import { processNaturalLanguage } from "./nlp/index.js";
 import Pino from "pino";
 import qrcode from "qrcode-terminal";
 import { normalizePhoneNumber, extractPhoneFromJid } from './utils.js';
-import { updateBotStatusInFirebase, db, resolveStoreUserId } from './firebase_client.js';
-import { onSnapshot, doc, updateDoc, deleteDoc, setDoc } from 'firebase/firestore';
+import { getMenu } from './menu.js';
+import { updateBotStatusInFirebase, db } from './firebase_client.js';
+import { onSnapshot, doc, collectionGroup, getDocs, updateDoc, deleteDoc, setDoc } from 'firebase/firestore';
 
 const logger = Pino();
-const AUTH_PATH = "./tokens/session-name";
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const LOCK_PATH = resolve(__dirname, "../tokens/session-name/.bot.lock");
+const AUTH_PATH = resolve(__dirname, "../tokens/session-name");
+const LOCK_PATH = resolve(AUTH_PATH, ".bot.lock");
 const ALLOWED_PHONE_NUMBER = (process.env.ALLOWED_PHONE_NUMBER || "").replace(/\D/g, "");
 const ALLOWED_CHAT_JID = String(process.env.ALLOWED_CHAT_JID || "").trim();
 const ALLOW_FROM_ME = String(process.env.ALLOW_FROM_ME || "false").toLowerCase() === "true";
@@ -36,8 +37,6 @@ let lockAcquired = false;
 let shuttingDown = false;
 let loggedMissingAllowedNumber = false;
 const loggedIgnoredReasons = new Set();
-const recentBotMessageIds = new Map();
-const RECENT_BOT_MESSAGE_TTL_MS = 5 * 60 * 1000;
 
 // Helper functions moved to utils.js
 
@@ -49,18 +48,6 @@ function isDirectChatJid(jid) {
   );
 }
 
-function extractTrustedPhoneForWhitelist(jid) {
-  if (!jid || typeof jid !== "string") {
-    return "";
-  }
-
-  if (!jid.endsWith("@s.whatsapp.net") && !jid.endsWith("@c.us")) {
-    return "";
-  }
-
-  return normalizePhoneNumber(jid.split("@")[0]?.split(":")[0] || "");
-}
-
 function logIgnoredReasonOnce(reason, details = "") {
   const key = `${reason}|${details}`;
   if (loggedIgnoredReasons.has(key)) {
@@ -70,38 +57,6 @@ function logIgnoredReasonOnce(reason, details = "") {
   loggedIgnoredReasons.add(key);
   const suffix = details ? ` (${details})` : "";
   console.log(`ℹ️ Ignored incoming message: ${reason}${suffix}`);
-}
-
-function rememberBotMessageId(messageId) {
-  if (!messageId) {
-    return;
-  }
-
-  recentBotMessageIds.set(messageId, Date.now());
-}
-
-function isRecentBotMessageId(messageId) {
-  if (!messageId) {
-    return false;
-  }
-
-  const createdAt = recentBotMessageIds.get(messageId);
-  if (!createdAt) {
-    return false;
-  }
-
-  if ((Date.now() - createdAt) > RECENT_BOT_MESSAGE_TTL_MS) {
-    recentBotMessageIds.delete(messageId);
-    return false;
-  }
-
-  return true;
-}
-
-async function sendTrackedMessage(sock, jid, content) {
-  const sent = await sock.sendMessage(jid, content);
-  rememberBotMessageId(sent?.key?.id);
-  return sent;
 }
 
 function extractIncomingText(messageContent) {
@@ -346,8 +301,10 @@ async function start() {
   // 📡 Listen for remote commands (like logout/unlink)
   setTimeout(async () => {
     try {
-      const userId = await resolveStoreUserId();
-      if (userId) {
+      const inventoryGroupRef = collectionGroup(db, 'inventory');
+      const inventorySnap = await getDocs(inventoryGroupRef);
+      if (!inventorySnap.empty) {
+        const userId = inventorySnap.docs[0].ref.path.split('/')[1];
         const botStatusRef = doc(db, `users/${userId}/bot/status`);
         
         onSnapshot(botStatusRef, async (snapshot) => {
@@ -418,24 +375,39 @@ async function start() {
         );
         updateBotStatusInFirebase({ qr: null, connection: "closed", isOnline: false, reason });
 
-      await resetAuthSessionIfNeeded(statusCode);
+        await resetAuthSessionIfNeeded(statusCode);
 
-      if (isNonRecoverableDisconnect(statusCode)) {
-        console.error("🚫 Non-recoverable disconnect detected.");
-        if (statusCode === 405) {
-          console.error("   WhatsApp rejected the session handshake (code 405).");
-          console.error("   1) Delete tokens and re-run the bot.");
-          console.error("   2) Scan a fresh QR on your primary WhatsApp device.");
-          console.error("   3) If it persists, try a different network/VPN or newer Baileys version.");
-        } else if (statusCode === DisconnectReason.connectionReplaced) {
-          console.error("   Another WhatsApp/Baileys session replaced this one (code 440).");
-          console.error("   1) Ensure only one bot process is running.");
-          console.error("   2) Do not run npm start and npm run dev at the same time.");
-          console.error("   3) Restart a single instance after other sessions are closed.");
+        if (isNonRecoverableDisconnect(statusCode)) {
+          console.error("🚫 Non-recoverable disconnect detected.");
+          if (statusCode === 405) {
+            console.error("   WhatsApp rejected the session handshake (code 405).");
+            console.error("   1) Delete tokens and re-run the bot.");
+            console.error("   2) Scan a fresh QR on your primary WhatsApp device.");
+            console.error("   3) If it persists, try a different network/VPN or newer Baileys version.");
+          } else if (statusCode === DisconnectReason.connectionReplaced) {
+            console.error("   Another WhatsApp/Baileys session replaced this one (code 440).");
+            console.error("   1) Ensure only one bot process is running.");
+            console.error("   2) Do not run npm start and npm run dev at the same time.");
+            console.error("   3) Restart a single instance after other sessions are closed.");
+          }
+          
+          // 🔥 PROACTIVE FIX: If we reset the session, immediately try to connect again
+          // instead of exiting and waiting for nodemon.
+          if (shouldResetSession(statusCode)) {
+            console.log("🔄 Attempting proactive reconnection with fresh session...");
+            // Small delay to ensure files are cleared
+            setTimeout(() => {
+              connectToWhatsApp().catch(err => {
+                console.error("❌ Proactive reconnection failed:", err.message);
+                shutdownAndExit(1);
+              });
+            }, 1000);
+            return;
+          }
+
+          await shutdownAndExit(1);
+          return;
         }
-        await shutdownAndExit(1);
-        return;
-      }
 
       await scheduleReconnect();
     }
@@ -445,18 +417,13 @@ async function start() {
     for (const message of messages) {
       try {
         const botNumber = client?.user?.id ? extractPhoneFromJid(client.user.id) : null;
+        const botJid = client?.user?.id || null;
         const remotePhone = message.key.remoteJid ? extractPhoneFromJid(message.key.remoteJid) : null;
-        const messageId = message.key?.id || "";
         
         // Is this message sent by the bot (me)?
         const isFromMe = !!message.key.fromMe;
         // Is this a self-chat (typing to myself)?
         const isSelfChat = isFromMe && (remotePhone === botNumber);
-
-        if (isFromMe && isRecentBotMessageId(messageId)) {
-          logIgnoredReasonOnce("bot echo", messageId);
-          continue;
-        }
         
         if (isFromMe && !isSelfChat && !ALLOW_FROM_ME) {
             // This is a message sent by the bot to a client. IGNORE to avoid loops.
@@ -497,35 +464,24 @@ async function start() {
         }
 
         const senderPhone = extractPhoneFromJid(from);
-        const whitelistPhone = extractTrustedPhoneForWhitelist(from);
 
-        const allowedByPhone = Boolean(
-          ALLOWED_PHONE_NUMBER &&
-          (
-            senderPhone === ALLOWED_PHONE_NUMBER ||
-            whitelistPhone === ALLOWED_PHONE_NUMBER ||
-            (isSelfChat && botNumber === ALLOWED_PHONE_NUMBER)
-          )
+        // Strict whitelist: Only ALLOWED_PHONE_NUMBER or ALLOWED_CHAT_JID or self-chat
+        const isWhitelisted = Boolean(
+          isSelfChat || 
+          (ALLOWED_PHONE_NUMBER && senderPhone === ALLOWED_PHONE_NUMBER) ||
+          (ALLOWED_CHAT_JID && from === ALLOWED_CHAT_JID)
         );
-        const allowedByJid = ALLOWED_CHAT_JID && from === ALLOWED_CHAT_JID;
 
-        const isAllowedSender = Boolean(isSelfChat || allowedByPhone || allowedByJid);
-        const isAdmin = Boolean(isSelfChat);
-
-        if (!isAllowedSender) {
-          logIgnoredReasonOnce(
-            "sender not allowed",
-            `${from}${senderPhone ? ` -> ${senderPhone}` : ""}`
-          );
+        if (!isWhitelisted) {
+          logIgnoredReasonOnce('unauthorized sender', from);
           continue;
         }
-        
-        if (isAdmin) {
-          console.log(`👑 ADMIN ACCESS GRANTED: from=${from}, senderPhone=${senderPhone}`);
-        }
-        
-        console.log(`📡 Message from ${from}: isFromMe=${isFromMe}, isSelfChat=${isSelfChat}, isAllowedSender=${isAllowedSender}, isAdmin=${isAdmin}`);
-        console.log(`   senderPhone: ${senderPhone}, whitelistPhone: ${whitelistPhone}, remotePhone: ${remotePhone}, allowed: ${ALLOWED_PHONE_NUMBER}`);
+
+        // ❌ ADMIN ACCESS REMOVED - Treat everyone as a customer
+        const isAdmin = false;
+
+        console.log(`📡 Message from ${from}: isFromMe=${isFromMe}, isSelfChat=${isSelfChat}, isAdmin=${isAdmin}`);
+        console.log(`   senderPhone: ${senderPhone}, allowed: ${ALLOWED_PHONE_NUMBER}, bot: ${botNumber} (${botJid})`);
 
         if (!text) {
           logIgnoredReasonOnce("empty text payload", from);
@@ -533,6 +489,57 @@ async function start() {
         }
 
         const state = getState(from);
+
+        // 📋 PRIORITY: Handle "menu" keyword immediately to bypass AI and stages
+        const cleanText = text.toLowerCase().trim();
+        if (cleanText === 'menu' || cleanText.includes('show me the menu') || cleanText.includes('show menu') || cleanText.includes('catalog')) {
+          console.log(`📋 "menu" keyword detected from ${from}, fetching fresh catalog...`);
+          const menu = await getMenu();
+          let msg = '🌟 *OUR CATALOG* 🌟\n';
+          msg += '━━━━━━━━━━━━━━━━\n\n';
+          
+          const inStock = [];
+          const outOfStock = [];
+
+          Object.keys(menu).forEach((key) => {
+            const item = menu[key];
+            if (Number(item.stock || 0) > 0) {
+              inStock.push(item);
+            } else {
+              outOfStock.push(item);
+            }
+          });
+
+          if (inStock.length > 0) {
+            msg += '🛒 *IN STOCK*\n';
+            inStock.forEach((item) => {
+              msg += `📦 *${item.description}*\n`;
+              msg += `💰 Price: ₹${item.price}\n`;
+              msg += `🔢 Quantity: ${item.stock} left\n\n`;
+            });
+          }
+
+          if (outOfStock.length > 0) {
+            msg += '━━━━━━━━━━━━━━━━\n';
+            msg += '🚫 *OUT OF STOCK*\n';
+            outOfStock.forEach((item) => {
+              msg += `📦 ~${item.description}~\n`;
+              msg += `💰 Price: ₹${item.price}\n\n`;
+            });
+          }
+          
+          msg += '━━━━━━━━━━━━━━━━\n';
+          msg += 'Type the *item name* to start your order! 🚀';
+          
+          // Clear any pending state if they ask for menu, so they aren't stuck in an order flow
+          state.stage = 1;
+          state.pendingItem = null;
+          state.pendingQuantity = null;
+          setState(from, state);
+
+          await client.sendMessage(from, { text: msg });
+          continue;
+        }
 
         // 🤖 Try Natural Language processing first (AI-powered ordering or Admin Query)
         const nlResult = await processNaturalLanguage({
@@ -546,21 +553,18 @@ async function start() {
         if (nlResult?.handled) {
           // NL processor handled the message
           if (typeof nlResult.response === "string" && nlResult.response.trim()) {
-            await sendTrackedMessage(client, from, { text: nlResult.response });
+            await client.sendMessage(from, { text: nlResult.response });
           }
           continue;
         }
 
         // Fall back to traditional stage-based routing
-        const messageResponse = await stages[state.stage].stage.exec({
-          from,
-          message: text,
-          client,
-          state,
-        });
+        const messageResponse = await (stages[state.stage].stage.exec.constructor.name === 'AsyncFunction' 
+          ? stages[state.stage].stage.exec({ from, message: text, client, state })
+          : Promise.resolve(stages[state.stage].stage.exec({ from, message: text, client, state })));
 
         if (typeof messageResponse === "string" && messageResponse.trim()) {
-          await sendTrackedMessage(client, from, { text: messageResponse });
+          await client.sendMessage(from, { text: messageResponse });
         }
       } catch (error) {
         console.error("Error processing message:", error);

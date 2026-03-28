@@ -65,6 +65,7 @@ Optional:
 - `ALLOWED_CHAT_JID`: exact WhatsApp JID allowed to trigger the bot
 - `GROQ_MODEL`: defaults to `llama-3.3-70b-versatile`
 - `ALLOW_FROM_ME`: set to `true` only for testing self-sent messages
+- `FIREBASE_USER_ID`: explicit `users/{uid}` branch to use when you want to skip merchant UID discovery or work around broken Firebase Auth
 
 ## Local development
 
@@ -92,14 +93,14 @@ npm run dev
 
 ## Firebase expectations
 
-The bot assumes a Firestore layout rooted under `users/{uid}` and discovers the merchant `uid` by querying the `inventory` collection group. At minimum, the connected merchant should have:
+The bot assumes a Firestore layout rooted under `users/{uid}` and discovers the merchant `uid` by querying the `inventory` collection group unless `FIREBASE_USER_ID` is provided. At minimum, the connected merchant should have:
 
 - `users/{uid}/inventory`
 - `users/{uid}/orders`
 - `users/{uid}/udhar`
 - `users/{uid}/bot/status`
 
-If inventory is empty, the bot cannot resolve which merchant to sync against.
+If inventory is empty and `FIREBASE_USER_ID` is not set, the bot cannot resolve which merchant to sync against.
 
 ## Production notes
 
