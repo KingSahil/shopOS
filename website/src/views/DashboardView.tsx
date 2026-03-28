@@ -1,10 +1,21 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import TopBar from '../components/TopBar';
 import { useToast } from '../contexts/ToastContext';
 import Modal from '../components/Modal';
 import { ViewState } from '../types';
-import { collection, onSnapshot, doc, getDoc, setDoc, updateDoc, writeBatch, increment } from 'firebase/firestore';
+import { collection, onSnapshot, doc, setDoc, updateDoc, writeBatch, increment } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from '../firebase';
+
+declare global {
+  interface Window {
+    BarcodeDetector?: {
+      new (options?: { formats?: string[] }): {
+        detect: (source: ImageBitmapSource) => Promise<Array<{ rawValue?: string }>>;
+      };
+      getSupportedFormats?: () => Promise<string[]>;
+    };
+  }
+}
 
 interface DashboardViewProps {
   setCurrentView: (view: ViewState) => void;
@@ -22,6 +33,31 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
   const [inventoryItems, setInventoryItems] = useState<any[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedItems, setSelectedItems] = useState<any[]>([]);
+  const [isScannerOpen, setIsScannerOpen] = useState(false);
+  const [isStartingScanner, setIsStartingScanner] = useState(false);
+  const [scannerError, setScannerError] = useState('');
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const scannerStreamRef = useRef<MediaStream | null>(null);
+  const scannerFrameRef = useRef<number | null>(null);
+  const lastDetectedRef = useRef<{ code: string; detectedAt: number } | null>(null);
+
+  const normalizeLookupValue = (value: unknown) => String(value ?? '').trim().toLowerCase();
+
+  const getItemUnitPrice = (item: any) => (
+    typeof item.unitPrice === 'number'
+      ? item.unitPrice
+      : parseFloat(String(item.price).replace(/[^\d.]/g, '')) || 0
+  );
+
+  const findInventoryItemByCode = (rawCode: string) => {
+    const normalizedCode = normalizeLookupValue(rawCode);
+    if (!normalizedCode) return null;
+
+    return inventoryItems.find(item => {
+      const candidates = [item.barcode, item.sku, item.id];
+      return candidates.some(candidate => normalizeLookupValue(candidate) === normalizedCode);
+    }) || null;
+  };
 
   useEffect(() => {
     if (!auth.currentUser) return;
@@ -81,22 +117,63 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
     };
   }, []);
 
-  const handleSelectItem = (item: any) => {
-    const existingItem = selectedItems.find(i => i.id === item.id);
-    if (existingItem) {
-      setSelectedItems(selectedItems.map(i => i.id === item.id ? { ...i, quantity: i.quantity + 1 } : i));
-    } else {
-      setSelectedItems([...selectedItems, { ...item, quantity: 1 }]);
+  const stopScanner = () => {
+    if (scannerFrameRef.current) {
+      cancelAnimationFrame(scannerFrameRef.current);
+      scannerFrameRef.current = null;
     }
+
+    if (scannerStreamRef.current) {
+      scannerStreamRef.current.getTracks().forEach(track => track.stop());
+      scannerStreamRef.current = null;
+    }
+
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.srcObject = null;
+    }
+
+    lastDetectedRef.current = null;
+  };
+
+  useEffect(() => {
+    if (!isQuickOrderModalOpen) {
+      stopScanner();
+      setIsScannerOpen(false);
+      setScannerError('');
+      setSearchQuery('');
+    }
+  }, [isQuickOrderModalOpen]);
+
+  useEffect(() => () => stopScanner(), []);
+
+  const handleSelectItem = (item: any, source: 'search' | 'barcode' = 'search') => {
+    setSelectedItems(currentItems => {
+      const existingItem = currentItems.find(i => i.id === item.id);
+      if (existingItem) {
+        return currentItems.map(i => i.id === item.id ? { ...i, quantity: i.quantity + 1 } : i);
+      }
+
+      return [...currentItems, { ...item, quantity: 1 }];
+    });
     setSearchQuery('');
+
+    const unitPrice = getItemUnitPrice(item);
+    const formattedPrice = unitPrice.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    showToast(
+      source === 'barcode'
+        ? `${item.name} added from barcode scan at ₹${formattedPrice}`
+        : `${item.name} added at ₹${formattedPrice}`,
+      'success'
+    );
   };
 
   const handleRemoveItem = (id: string) => {
-    setSelectedItems(selectedItems.filter(i => i.id !== id));
+    setSelectedItems(currentItems => currentItems.filter(i => i.id !== id));
   };
 
   const handleQuantityChange = (id: string, delta: number) => {
-    setSelectedItems(selectedItems.map(i => {
+    setSelectedItems(currentItems => currentItems.map(i => {
       if (i.id === id) {
         const newQuantity = Math.max(1, i.quantity + delta);
         return { ...i, quantity: newQuantity };
@@ -123,12 +200,106 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
     }
   };
 
+  const handleQuickOrderInput = (value: string) => {
+    setSearchQuery(value);
+
+    const exactMatch = findInventoryItemByCode(value);
+    if (exactMatch) {
+      handleSelectItem(exactMatch, 'barcode');
+    }
+  };
+
+  const startBarcodeScanner = async () => {
+    if (!window.BarcodeDetector) {
+      setScannerError('This browser does not support live camera barcode scanning. You can still use a hardware scanner or type the SKU/barcode.');
+      showToast('Live barcode scanning is not supported on this device', 'error');
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setScannerError('Camera access is not available on this device. You can still use a hardware scanner or type the SKU/barcode.');
+      showToast('Camera access is not available on this device', 'error');
+      return;
+    }
+
+    try {
+      stopScanner();
+      setScannerError('');
+      setIsScannerOpen(true);
+      setIsStartingScanner(true);
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: 'environment' }
+        },
+        audio: false
+      });
+
+      scannerStreamRef.current = stream;
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+
+      const detector = new window.BarcodeDetector({
+        formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'codabar']
+      });
+
+      const scanFrame = async () => {
+        if (!videoRef.current) return;
+
+        try {
+          const detectedBarcodes = await detector.detect(videoRef.current);
+          const rawCode = detectedBarcodes[0]?.rawValue;
+
+          if (rawCode) {
+            const normalizedCode = normalizeLookupValue(rawCode);
+            const now = Date.now();
+            const lastDetected = lastDetectedRef.current;
+
+            if (!lastDetected || lastDetected.code !== normalizedCode || now - lastDetected.detectedAt > 2500) {
+              lastDetectedRef.current = { code: normalizedCode, detectedAt: now };
+
+              const matchedItem = findInventoryItemByCode(rawCode);
+              if (matchedItem) {
+                handleSelectItem(matchedItem, 'barcode');
+              } else {
+                setScannerError(`Scanned code ${rawCode} was not found in inventory. Match against product barcode or SKU to enable auto-add.`);
+                showToast(`No inventory item found for barcode ${rawCode}`, 'error');
+              }
+            }
+          }
+        } catch (error) {
+          console.error('Barcode scan failed:', error);
+        }
+
+        scannerFrameRef.current = requestAnimationFrame(scanFrame);
+      };
+
+      scannerFrameRef.current = requestAnimationFrame(scanFrame);
+    } catch (error) {
+      console.error('Error starting barcode scanner:', error);
+      setIsScannerOpen(false);
+      setScannerError('Camera access was blocked. Allow camera permission to scan product barcodes.');
+      showToast('Unable to start barcode scanner', 'error');
+      stopScanner();
+    } finally {
+      setIsStartingScanner(false);
+    }
+  };
+
   const filteredItems = searchQuery.trim() === '' 
     ? [] 
-    : inventoryItems.filter(item => item.name.toLowerCase().includes(searchQuery.toLowerCase()));
+    : inventoryItems.filter(item => {
+      const query = searchQuery.toLowerCase();
+      return item.name.toLowerCase().includes(query)
+        || normalizeLookupValue(item.sku).includes(query)
+        || normalizeLookupValue(item.barcode).includes(query);
+    });
 
   const totalAmount = selectedItems.reduce((sum, item) => {
-    const price = typeof item.unitPrice === 'number' ? item.unitPrice : parseFloat(String(item.price).replace(/[^\d.]/g, '')) || 0;
+    const price = getItemUnitPrice(item);
     return sum + (price * item.quantity);
   }, 0);
 
@@ -375,31 +546,78 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
           </div>
           <div>
             <label className="block text-sm font-bold text-on-surface mb-1">Scan Barcode or Search Item</label>
-            <div className="relative">
-              <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-outline">search</span>
-              <input 
-                type="text" 
-                placeholder="Search..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-10 pr-4 py-3 bg-surface-container-highest border-none rounded-sm focus:ring-1 focus:ring-secondary font-body text-sm outline-none transition-shadow"
-              />
-              {filteredItems.length > 0 && (
-                <div className="absolute top-full left-0 right-0 mt-1 bg-surface-container-lowest border border-outline-variant/20 rounded-sm shadow-lg z-50 max-h-48 overflow-y-auto">
-                  {filteredItems.map(item => (
-                    <div 
-                      key={item.id} 
-                      onClick={() => handleSelectItem(item)}
-                      className="px-4 py-3 hover:bg-surface-bright cursor-pointer flex justify-between items-center border-b border-outline-variant/10 last:border-0"
-                    >
-                      <div>
-                        <p className="font-bold text-sm text-on-surface">{item.name}</p>
-                        <p className="text-xs text-on-surface-variant">{item.category} • Stock: {item.stock}</p>
-                      </div>
-                      <span className="font-bold text-primary">₹{item.unitPrice || item.price}</span>
+            <div className="flex flex-col gap-3">
+              <div className="flex gap-2">
+                <div className="relative flex-1">
+                  <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-outline">search</span>
+                  <input 
+                    type="text" 
+                    placeholder="Search by item name, SKU, or barcode"
+                    value={searchQuery}
+                    onChange={(e) => handleQuickOrderInput(e.target.value)}
+                    className="w-full pl-10 pr-4 py-3 bg-surface-container-highest border-none rounded-sm focus:ring-1 focus:ring-secondary font-body text-sm outline-none transition-shadow"
+                  />
+                  {filteredItems.length > 0 && (
+                    <div className="absolute top-full left-0 right-0 mt-1 bg-surface-container-lowest border border-outline-variant/20 rounded-sm shadow-lg z-50 max-h-48 overflow-y-auto">
+                      {filteredItems.map(item => (
+                        <div 
+                          key={item.id} 
+                          onClick={() => handleSelectItem(item)}
+                          className="px-4 py-3 hover:bg-surface-bright cursor-pointer flex justify-between items-center border-b border-outline-variant/10 last:border-0"
+                        >
+                          <div>
+                            <p className="font-bold text-sm text-on-surface">{item.name}</p>
+                            <p className="text-xs text-on-surface-variant">
+                              {item.category} • Stock: {item.stock}
+                              {item.sku ? ` • SKU: ${item.sku}` : ''}
+                            </p>
+                          </div>
+                          <span className="font-bold text-primary">₹{getItemUnitPrice(item).toFixed(2)}</span>
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  )}
                 </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (isScannerOpen) {
+                      stopScanner();
+                      setIsScannerOpen(false);
+                      setScannerError('');
+                    } else {
+                      startBarcodeScanner();
+                    }
+                  }}
+                  className={`h-12 px-4 rounded-full font-bold text-sm flex items-center justify-center gap-2 transition-colors whitespace-nowrap ${
+                    isScannerOpen
+                      ? 'bg-error/10 text-error border border-error/20'
+                      : 'bg-secondary text-white hover:opacity-90'
+                  }`}
+                >
+                  <span className="material-symbols-outlined text-[20px]">{isScannerOpen ? 'stop_circle' : 'qr_code_scanner'}</span>
+                  {isStartingScanner ? 'Starting...' : isScannerOpen ? 'Stop Scan' : 'Scan'}
+                </button>
+              </div>
+              {isScannerOpen && (
+                <div className="rounded-[1rem] overflow-hidden border border-outline-variant/20 bg-surface-container-highest">
+                  <div className="aspect-[4/3] bg-on-surface/90 relative">
+                    <video
+                      ref={videoRef}
+                      className="w-full h-full object-cover"
+                      autoPlay
+                      muted
+                      playsInline
+                    />
+                    <div className="absolute inset-x-6 top-1/2 -translate-y-1/2 border-2 border-dashed border-secondary rounded-2xl h-28 pointer-events-none"></div>
+                    <div className="absolute left-4 right-4 bottom-4 text-center text-white text-xs font-bold tracking-wide">
+                      Align the barcode inside the frame to add the item automatically
+                    </div>
+                  </div>
+                </div>
+              )}
+              {scannerError && (
+                <p className="text-xs text-error font-medium">{scannerError}</p>
               )}
             </div>
           </div>
@@ -412,7 +630,7 @@ export default function DashboardView({ setCurrentView }: DashboardViewProps) {
                   <div key={item.id} className="flex justify-between items-center bg-surface-container-lowest p-3 rounded-sm">
                     <div className="flex-1">
                       <p className="font-bold text-sm text-on-surface">{item.name}</p>
-                      <p className="text-xs text-primary font-bold">₹{item.unitPrice || item.price}</p>
+                      <p className="text-xs text-primary font-bold">₹{getItemUnitPrice(item).toFixed(2)}</p>
                     </div>
                     <div className="flex items-center gap-3">
                       <div className="flex items-center bg-surface-container-highest rounded-full">

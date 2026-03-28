@@ -36,6 +36,8 @@ let lockAcquired = false;
 let shuttingDown = false;
 let loggedMissingAllowedNumber = false;
 const loggedIgnoredReasons = new Set();
+const recentBotMessageIds = new Map();
+const RECENT_BOT_MESSAGE_TTL_MS = 5 * 60 * 1000;
 
 // Helper functions moved to utils.js
 
@@ -47,6 +49,18 @@ function isDirectChatJid(jid) {
   );
 }
 
+function extractTrustedPhoneForWhitelist(jid) {
+  if (!jid || typeof jid !== "string") {
+    return "";
+  }
+
+  if (!jid.endsWith("@s.whatsapp.net") && !jid.endsWith("@c.us")) {
+    return "";
+  }
+
+  return normalizePhoneNumber(jid.split("@")[0]?.split(":")[0] || "");
+}
+
 function logIgnoredReasonOnce(reason, details = "") {
   const key = `${reason}|${details}`;
   if (loggedIgnoredReasons.has(key)) {
@@ -56,6 +70,38 @@ function logIgnoredReasonOnce(reason, details = "") {
   loggedIgnoredReasons.add(key);
   const suffix = details ? ` (${details})` : "";
   console.log(`ℹ️ Ignored incoming message: ${reason}${suffix}`);
+}
+
+function rememberBotMessageId(messageId) {
+  if (!messageId) {
+    return;
+  }
+
+  recentBotMessageIds.set(messageId, Date.now());
+}
+
+function isRecentBotMessageId(messageId) {
+  if (!messageId) {
+    return false;
+  }
+
+  const createdAt = recentBotMessageIds.get(messageId);
+  if (!createdAt) {
+    return false;
+  }
+
+  if ((Date.now() - createdAt) > RECENT_BOT_MESSAGE_TTL_MS) {
+    recentBotMessageIds.delete(messageId);
+    return false;
+  }
+
+  return true;
+}
+
+async function sendTrackedMessage(sock, jid, content) {
+  const sent = await sock.sendMessage(jid, content);
+  rememberBotMessageId(sent?.key?.id);
+  return sent;
 }
 
 function extractIncomingText(messageContent) {
@@ -402,11 +448,17 @@ async function start() {
       try {
         const botNumber = client?.user?.id ? extractPhoneFromJid(client.user.id) : null;
         const remotePhone = message.key.remoteJid ? extractPhoneFromJid(message.key.remoteJid) : null;
+        const messageId = message.key?.id || "";
         
         // Is this message sent by the bot (me)?
         const isFromMe = !!message.key.fromMe;
         // Is this a self-chat (typing to myself)?
         const isSelfChat = isFromMe && (remotePhone === botNumber);
+
+        if (isFromMe && isRecentBotMessageId(messageId)) {
+          logIgnoredReasonOnce("bot echo", messageId);
+          continue;
+        }
         
         if (isFromMe && !isSelfChat && !ALLOW_FROM_ME) {
             // This is a message sent by the bot to a client. IGNORE to avoid loops.
@@ -447,18 +499,35 @@ async function start() {
         }
 
         const senderPhone = extractPhoneFromJid(from);
+        const whitelistPhone = extractTrustedPhoneForWhitelist(from);
 
-        const allowedByPhone = ALLOWED_PHONE_NUMBER && (senderPhone === ALLOWED_PHONE_NUMBER || remotePhone === ALLOWED_PHONE_NUMBER);
+        const allowedByPhone = Boolean(
+          ALLOWED_PHONE_NUMBER &&
+          (
+            senderPhone === ALLOWED_PHONE_NUMBER ||
+            whitelistPhone === ALLOWED_PHONE_NUMBER ||
+            (isSelfChat && botNumber === ALLOWED_PHONE_NUMBER)
+          )
+        );
         const allowedByJid = ALLOWED_CHAT_JID && from === ALLOWED_CHAT_JID;
-        
-        const isAdmin = Boolean(isSelfChat || allowedByPhone || allowedByJid);
+
+        const isAllowedSender = Boolean(isSelfChat || allowedByPhone || allowedByJid);
+        const isAdmin = Boolean(isSelfChat);
+
+        if (!isAllowedSender) {
+          logIgnoredReasonOnce(
+            "sender not allowed",
+            `${from}${senderPhone ? ` -> ${senderPhone}` : ""}`
+          );
+          continue;
+        }
         
         if (isAdmin) {
           console.log(`👑 ADMIN ACCESS GRANTED: from=${from}, senderPhone=${senderPhone}`);
         }
         
-        console.log(`📡 Message from ${from}: isFromMe=${isFromMe}, isSelfChat=${isSelfChat}, isAdmin=${isAdmin}`);
-        console.log(`   senderPhone: ${senderPhone}, remotePhone: ${remotePhone}, allowed: ${ALLOWED_PHONE_NUMBER}`);
+        console.log(`📡 Message from ${from}: isFromMe=${isFromMe}, isSelfChat=${isSelfChat}, isAllowedSender=${isAllowedSender}, isAdmin=${isAdmin}`);
+        console.log(`   senderPhone: ${senderPhone}, whitelistPhone: ${whitelistPhone}, remotePhone: ${remotePhone}, allowed: ${ALLOWED_PHONE_NUMBER}`);
 
         if (!text) {
           logIgnoredReasonOnce("empty text payload", from);
@@ -479,7 +548,7 @@ async function start() {
         if (nlResult?.handled) {
           // NL processor handled the message
           if (typeof nlResult.response === "string" && nlResult.response.trim()) {
-            await client.sendMessage(from, { text: nlResult.response });
+            await sendTrackedMessage(client, from, { text: nlResult.response });
           }
           continue;
         }
@@ -493,7 +562,7 @@ async function start() {
         });
 
         if (typeof messageResponse === "string" && messageResponse.trim()) {
-          await client.sendMessage(from, { text: messageResponse });
+          await sendTrackedMessage(client, from, { text: messageResponse });
         }
       } catch (error) {
         console.error("Error processing message:", error);
