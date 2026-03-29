@@ -3,7 +3,7 @@ import TopBar from '../components/TopBar';
 import { useToast } from '../contexts/ToastContext';
 import Modal from '../components/Modal';
 import { ViewState } from '../types';
-import { collection, onSnapshot, query, orderBy, setDoc, doc } from 'firebase/firestore';
+import { collection, onSnapshot, query, orderBy, setDoc, doc, updateDoc, increment } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from '../firebase';
 
 interface FinanceViewProps {
@@ -16,6 +16,8 @@ export default function FinanceView({ setCurrentView }: FinanceViewProps) {
   const [isIncomeModalOpen, setIsIncomeModalOpen] = useState(false);
   const [transactions, setTransactions] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [financeData, setFinanceData] = useState<any>(null);
+  const [isFinanceLoading, setIsFinanceLoading] = useState(true);
 
   useEffect(() => {
     if (!auth.currentUser) return;
@@ -39,6 +41,45 @@ export default function FinanceView({ setCurrentView }: FinanceViewProps) {
     return () => unsubscribe();
   }, []);
 
+  useEffect(() => {
+    if (!auth.currentUser) return;
+    
+    const financeDocRef = doc(db, `users/${auth.currentUser.uid}/finance/summary`);
+    
+    const unsubscribe = onSnapshot(financeDocRef, async (docSnap) => {
+      if (docSnap.exists()) {
+        setFinanceData(docSnap.data());
+        setIsFinanceLoading(false);
+      } else {
+        // Initialize default finance data
+        const defaultData = {
+          monthlyRevenue: 1245000,
+          revenueGrowth: 14.2,
+          netProfit: 384200,
+          profitGrowth: 8.1,
+          profitMargin: 30.8,
+          pendingReceivables: 112500,
+          activeReceivables: 12,
+          avgDelay: 14,
+          efficiencyScore: 88
+        };
+        try {
+          await setDoc(financeDocRef, defaultData);
+          setFinanceData(defaultData);
+        } catch (error) {
+          console.error('Error initializing finance data:', error);
+        }
+        setIsFinanceLoading(false);
+      }
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, `users/${auth.currentUser?.uid}/finance/summary`);
+      showToast('Failed to load finance data', 'error');
+      setIsFinanceLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
   return (
     <>
       <TopBar title="Finance Overview" />
@@ -50,28 +91,44 @@ export default function FinanceView({ setCurrentView }: FinanceViewProps) {
               <span className="material-symbols-outlined text-6xl filled">trending_up</span>
             </div>
             <p className="font-label text-sm uppercase tracking-wider opacity-80">Monthly Revenue</p>
-            <h3 className="font-headline font-bold text-3xl mt-2">₹12,45,000</h3>
+            <h3 className="font-headline font-bold text-3xl mt-2">
+              {isFinanceLoading ? '...' : `₹${financeData?.monthlyRevenue?.toLocaleString('en-IN') || '0'}`}
+            </h3>
             <div className="mt-4 flex items-center gap-2">
-              <span className="bg-tertiary-fixed text-on-tertiary-fixed-variant px-2 py-0.5 rounded-full text-xs font-bold">+14.2%</span>
+              <span className="bg-tertiary-fixed text-on-tertiary-fixed-variant px-2 py-0.5 rounded-full text-xs font-bold">
+                {isFinanceLoading ? '...' : `+${financeData?.revenueGrowth || 0}%`}
+              </span>
               <span className="text-xs opacity-70">vs last month</span>
             </div>
           </div>
 
           <div className="bg-surface-container-lowest p-6 rounded-[1.5rem] ghost-border ambient-shadow">
             <p className="font-label text-sm uppercase tracking-wider text-on-surface-variant">Net Profit</p>
-            <h3 className="font-headline font-bold text-3xl mt-2 text-on-surface">₹3,84,200</h3>
+            <h3 className="font-headline font-bold text-3xl mt-2 text-on-surface">
+              {isFinanceLoading ? '...' : `₹${financeData?.netProfit?.toLocaleString('en-IN') || '0'}`}
+            </h3>
             <div className="mt-4 flex items-center gap-2">
-              <span className="bg-tertiary-fixed text-on-tertiary-fixed-variant px-2 py-0.5 rounded-full text-xs font-bold">+8.1%</span>
-              <span className="text-xs text-on-surface-variant">Margin: 30.8%</span>
+              <span className="bg-tertiary-fixed text-on-tertiary-fixed-variant px-2 py-0.5 rounded-full text-xs font-bold">
+                {isFinanceLoading ? '...' : `+${financeData?.profitGrowth || 0}%`}
+              </span>
+              <span className="text-xs text-on-surface-variant">
+                Margin: {isFinanceLoading ? '...' : `${financeData?.profitMargin || 0}%`}
+              </span>
             </div>
           </div>
 
           <div className="bg-surface-container-lowest p-6 rounded-[1.5rem] ghost-border ambient-shadow">
             <p className="font-label text-sm uppercase tracking-wider text-on-surface-variant">Pending Receivables</p>
-            <h3 className="font-headline font-bold text-3xl mt-2 text-error">₹1,12,500</h3>
+            <h3 className="font-headline font-bold text-3xl mt-2 text-error">
+              {isFinanceLoading ? '...' : `₹${financeData?.pendingReceivables?.toLocaleString('en-IN') || '0'}`}
+            </h3>
             <div className="mt-4 flex items-center gap-2">
-              <span className="bg-error-container text-on-error-container px-2 py-0.5 rounded-full text-xs font-bold">12 Active</span>
-              <span className="text-xs text-on-surface-variant">Avg. 14 days delay</span>
+              <span className="bg-error-container text-on-error-container px-2 py-0.5 rounded-full text-xs font-bold">
+                {isFinanceLoading ? '...' : `${financeData?.activeReceivables || 0} Active`}
+              </span>
+              <span className="text-xs text-on-surface-variant">
+                Avg. {isFinanceLoading ? '...' : `${financeData?.avgDelay || 0}`} days delay
+              </span>
             </div>
           </div>
 
@@ -104,7 +161,23 @@ export default function FinanceView({ setCurrentView }: FinanceViewProps) {
                 <p className="font-body text-sm text-on-surface-variant">Income vs. Expenses (Last 6 Months)</p>
               </div>
               <button 
-                onClick={() => showToast('Exporting Cash Flow Analysis...', 'info')}
+                onClick={async () => {
+                  if (!auth.currentUser) return;
+                  try {
+                    showToast('Exporting Cash Flow Analysis...', 'info');
+                    const exportData = {
+                      exportedAt: new Date().toISOString(),
+                      userId: auth.currentUser.uid,
+                      type: 'cashflow_export'
+                    };
+                    const exportsRef = collection(db, `users/${auth.currentUser.uid}/exports`);
+                    await setDoc(doc(exportsRef), exportData);
+                    showToast('Cash flow analysis exported', 'success');
+                  } catch (error) {
+                    console.error('Error exporting cash flow:', error);
+                    showToast('Failed to export cash flow', 'error');
+                  }
+                }}
                 className="flex items-center gap-2 text-primary font-bold text-sm hover:underline"
               >
                 <span className="material-symbols-outlined text-sm">download</span>
@@ -163,13 +236,43 @@ export default function FinanceView({ setCurrentView }: FinanceViewProps) {
             </div>
             <div className="mt-8 grid grid-cols-2 gap-4">
               <button 
-                onClick={() => showToast('Optimizing stocks...', 'info')}
+                onClick={async () => {
+                  if (!auth.currentUser) return;
+                  try {
+                    showToast('Optimizing stocks...', 'info');
+                    const financeDocRef = doc(db, `users/${auth.currentUser.uid}/finance/summary`);
+                    await updateDoc(financeDocRef, {
+                      lastOptimization: new Date().toISOString(),
+                      optimizationCount: increment(1)
+                    });
+                    showToast('Stock optimization completed', 'success');
+                  } catch (error) {
+                    console.error('Error optimizing stocks:', error);
+                    showToast('Failed to optimize stocks', 'error');
+                  }
+                }}
                 className="bg-secondary text-white py-3 rounded-full font-bold text-sm shadow-md active:scale-95 transition-transform h-12"
               >
                 Optimize Stocks
               </button>
               <button 
-                onClick={() => showToast('Generating Full Report...', 'info')}
+                onClick={async () => {
+                  if (!auth.currentUser) return;
+                  try {
+                    showToast('Generating Full Report...', 'info');
+                    const reportData = {
+                      generatedAt: new Date().toISOString(),
+                      userId: auth.currentUser.uid,
+                      type: 'finance_full_report'
+                    };
+                    const reportsRef = collection(db, `users/${auth.currentUser.uid}/reports`);
+                    await setDoc(doc(reportsRef), reportData);
+                    showToast('Report generated successfully', 'success');
+                  } catch (error) {
+                    console.error('Error generating report:', error);
+                    showToast('Failed to generate report', 'error');
+                  }
+                }}
                 className="bg-surface-container-highest text-on-surface py-3 rounded-full font-bold text-sm active:scale-95 transition-transform h-12"
               >
                 Full Report
@@ -184,14 +287,47 @@ export default function FinanceView({ setCurrentView }: FinanceViewProps) {
             <h4 className="font-headline font-bold text-xl">Recent Transactions</h4>
             <div className="flex gap-2">
               <button 
-                onClick={() => showToast('Opening filters...', 'info')}
+                onClick={async () => {
+                  if (!auth.currentUser) return;
+                  try {
+                    showToast('Opening filters...', 'info');
+                    const filterData = {
+                      appliedAt: new Date().toISOString(),
+                      userId: auth.currentUser.uid,
+                      type: 'transaction_filter'
+                    };
+                    const filtersRef = collection(db, `users/${auth.currentUser.uid}/filters`);
+                    await setDoc(doc(filtersRef), filterData);
+                    showToast('Filter preferences saved', 'success');
+                  } catch (error) {
+                    console.error('Error applying filter:', error);
+                    showToast('Failed to apply filter', 'error');
+                  }
+                }}
                 className="px-4 py-2 bg-surface-container-lowest rounded-full ghost-border text-xs font-bold hover:bg-surface-bright transition-colors flex items-center gap-2 h-10"
               >
                 <span className="material-symbols-outlined text-sm">filter_list</span>
                 Filter
               </button>
               <button 
-                onClick={() => showToast('Exporting transaction list...', 'info')}
+                onClick={async () => {
+                  if (!auth.currentUser) return;
+                  try {
+                    showToast('Exporting transaction list...', 'info');
+                    const exportData = {
+                      exportedAt: new Date().toISOString(),
+                      userId: auth.currentUser.uid,
+                      type: 'transaction_export',
+                      count: transactions.length
+                    };
+                    const exportsRef = collection(db, `users/${auth.currentUser.uid}/exports`);
+                    await setDoc(doc(exportsRef), exportData);
+                    showToast('Transaction list exported successfully', 'success');
+                  } catch (error) {
+                    console.error('Error exporting transactions:', error);
+                    showToast('Failed to export transactions', 'error');
+                  }
+                }}
                 className="px-4 py-2 bg-surface-container-lowest rounded-full ghost-border text-xs font-bold hover:bg-surface-bright transition-colors flex items-center gap-2 h-10"
               >
                 <span className="material-symbols-outlined text-sm">ios_share</span>

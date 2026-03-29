@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import TopBar from '../components/TopBar';
 import { useToast } from '../contexts/ToastContext';
 import { ViewState } from '../types';
-import { collection, onSnapshot, doc, deleteDoc, updateDoc, runTransaction } from 'firebase/firestore';
+import { collection, onSnapshot, doc, deleteDoc, updateDoc, runTransaction, setDoc, addDoc, Timestamp } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from '../firebase';
 import Modal from '../components/Modal';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -30,6 +30,8 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
   const [inventoryItems, setInventoryItems] = useState<any[]>([]);
   const [quickOrderSearchQuery, setQuickOrderSearchQuery] = useState('');
   const [selectedItems, setSelectedItems] = useState<any[]>([]);
+  const [paymentMethod, setPaymentMethod] = useState<'cash' | 'udhaar'>('cash');
+  const [udharCustomers, setUdharCustomers] = useState<any[]>([]);
   const getAvailableStock = (item: any) => Math.max(0, Number(item?.stock) || 0);
   const showInsufficientStockAlert = (itemName: string, requestedQuantity: number, availableStock: number) => {
     window.alert(
@@ -66,12 +68,20 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
     
     const ordersRef = collection(db, `users/${auth.currentUser.uid}/orders`);
     const inventoryRef = collection(db, `users/${auth.currentUser.uid}/inventory`);
+    const udharRef = collection(db, `users/${auth.currentUser.uid}/udhar`);
 
     const unsubscribeInventory = onSnapshot(inventoryRef, (snapshot) => {
       const items = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id }));
       setInventoryItems(items);
     }, (error) => {
       console.error('Error fetching inventory:', error);
+    });
+
+    const unsubscribeUdhar = onSnapshot(udharRef, (snapshot) => {
+      const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setUdharCustomers(items);
+    }, (error) => {
+      console.error('Error fetching udhar customers:', error);
     });
     
     const unsubscribe = onSnapshot(ordersRef, (snapshot) => {
@@ -95,6 +105,7 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
     return () => {
       unsubscribe();
       unsubscribeInventory();
+      unsubscribeUdhar();
     };
   }, []);
 
@@ -166,7 +177,32 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
         status: 'Delivered',
         sColor: 'tertiary'
       });
-      showToast(`Order ${order.id} marked as delivered`, 'success');
+      
+      // Send WhatsApp notification if phone number is available
+      if (order.phone && order.phone !== 'N/A') {
+        try {
+          const whatsappMessagesRef = collection(db, `users/${auth.currentUser.uid}/whatsapp_messages`);
+          const messageDoc = doc(whatsappMessagesRef);
+          
+          const message = `✅ *Order Delivered Successfully!*\n\nHi ${order.customer},\n\nYour order ${order.id} has been delivered.\n\n📦 *Order Details:*\n• Items: ${order.name}\n• Amount: ₹${order.amount}\n• Date: ${order.date}\n\nThank you for your business! 🙏`;
+          
+          await setDoc(messageDoc, {
+            to: order.phone,
+            message: message,
+            orderId: order.id,
+            status: 'pending',
+            createdAt: new Date().toISOString(),
+            type: 'order_delivered'
+          });
+          
+          showToast(`Order ${order.id} marked as delivered. WhatsApp message queued.`, 'success');
+        } catch (whatsappError) {
+          console.error("Error queuing WhatsApp message:", whatsappError);
+          showToast(`Order ${order.id} marked as delivered (WhatsApp notification failed)`, 'success');
+        }
+      } else {
+        showToast(`Order ${order.id} marked as delivered`, 'success');
+      }
     } catch (error) {
       console.error("Error updating order:", error);
       showToast('Failed to update order status', 'error');
@@ -515,6 +551,8 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
             const transactionsRef = collection(db, `users/${auth.currentUser.uid}/transactions`);
             const transactionRef = doc(transactionsRef);
 
+            const isUdhaar = paymentMethod === 'udhaar';
+            
             const newOrder = {
               id: `#ORD-${Math.floor(Math.random() * 100000)}`,
               name: selectedItems.length === 1 ? selectedItems[0].name : `${selectedItems.length} Items`,
@@ -522,9 +560,9 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
               customer: customerName,
               phone: customerPhone,
               initials: customerName.substring(0, 2).toUpperCase(),
-              status: 'Delivered',
+              status: isUdhaar ? 'Pending' : 'Delivered',
               amount: totalAmount.toFixed(2),
-              sColor: 'tertiary',
+              sColor: isUdhaar ? 'secondary' : 'tertiary',
               items: selectedItems
             };
 
@@ -532,15 +570,15 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
               id: `#TR-${Math.floor(Math.random() * 100000)}`,
               entity: customerName,
               initials: customerName.substring(0, 2).toUpperCase(),
-              bg: 'bg-tertiary-fixed',
+              bg: isUdhaar ? 'bg-secondary-fixed' : 'bg-tertiary-fixed',
               phone: customerPhone,
-              text: 'text-on-tertiary-fixed',
+              text: isUdhaar ? 'text-on-secondary-fixed' : 'text-on-tertiary-fixed',
               date: new Date().toLocaleDateString('en-US', { day: 'numeric', month: 'short', year: 'numeric' }),
-              status: 'COMPLETED',
-              statusBg: 'bg-tertiary-fixed',
-              statusText: 'text-on-tertiary-fixed-variant',
+              status: isUdhaar ? 'PENDING' : 'COMPLETED',
+              statusBg: isUdhaar ? 'bg-secondary-fixed' : 'bg-tertiary-fixed',
+              statusText: isUdhaar ? 'text-on-secondary-fixed-variant' : 'text-on-tertiary-fixed-variant',
               amount: `+ ₹${totalAmount.toFixed(2)}`,
-              amountColor: 'text-tertiary'
+              amountColor: isUdhaar ? 'text-secondary' : 'text-tertiary'
             };
 
             await runTransaction(db, async (transaction) => {
@@ -574,10 +612,63 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
               transaction.set(transactionRef, newTransaction);
             });
 
-            showToast('Order created successfully and stock updated', 'success');
+            // Add to udhaar ledger if payment method is udhaar
+            if (isUdhaar) {
+              const udharRef = collection(db, `users/${auth.currentUser.uid}/udhar`);
+              const udharTransactionsRef = collection(db, `users/${auth.currentUser.uid}/udharTransactions`);
+              
+              const parseCurrencyValue = (value: unknown) => {
+                if (typeof value === 'number') return value;
+                return parseFloat(String(value ?? '').replace(/[^\d.-]/g, '')) || 0;
+              };
+              
+              // Add transaction to udharTransactions
+              await addDoc(udharTransactionsRef, {
+                customerId: customerPhone || customerName,
+                customerName: customerName,
+                type: 'credit',
+                amount: totalAmount,
+                description: selectedItems.length === 1 ? selectedItems[0].name : `${selectedItems.length} Items`,
+                timestamp: Timestamp.now(),
+                paymentMethod: 'udhaar'
+              });
+
+              // Update or create customer in udhar collection
+              const existingCustomer = udharCustomers.find(c => 
+                c.phone === customerPhone || c.name === customerName
+              );
+
+              if (existingCustomer) {
+                const customerRef = doc(db, `users/${auth.currentUser.uid}/udhar/${existingCustomer.id}`);
+                const currentAmount = parseCurrencyValue(existingCustomer.amount);
+                await updateDoc(customerRef, {
+                  amount: (currentAmount + totalAmount).toLocaleString('en-IN'),
+                  lastUpdated: new Date().toISOString()
+                });
+              } else {
+                await addDoc(udharRef, {
+                  name: customerName,
+                  initials: customerName.substring(0, 2).toUpperCase(),
+                  lastPayment: 'Never',
+                  amount: totalAmount.toLocaleString('en-IN'),
+                  bg: 'bg-secondary-fixed',
+                  text: 'text-on-secondary-container',
+                  phone: customerPhone,
+                  lastUpdated: new Date().toISOString()
+                });
+              }
+            }
+
+            showToast(
+              isUdhaar 
+                ? `Order created on credit. ₹${totalAmount.toFixed(2)} added to ${customerName}'s udhaar balance` 
+                : 'Order created successfully and stock updated', 
+              'success'
+            );
             setIsQuickOrderModalOpen(false);
             setSelectedItems([]);
             setQuickOrderSearchQuery('');
+            setPaymentMethod('cash');
           } catch (error) {
             const isInventoryAvailabilityError = error instanceof Error
               && (error.message.includes('not available') || error.message.includes('no longer available'));
@@ -592,6 +683,47 @@ export default function OrdersView({ setCurrentView, setSelectedOrderId }: Order
             showToast('Failed to create order', 'error');
           }
         }}>
+          <div>
+            <label className="block text-sm font-bold text-on-surface mb-2">Payment Method</label>
+            <div className="grid grid-cols-2 gap-3 mb-5">
+              <button
+                type="button"
+                onClick={() => setPaymentMethod('cash')}
+                className={`p-4 rounded-xl border-2 transition-all ${
+                  paymentMethod === 'cash'
+                    ? 'border-tertiary bg-tertiary-fixed/20 shadow-sm'
+                    : 'border-outline-variant/20 bg-surface-container-highest hover:bg-surface-bright'
+                }`}
+              >
+                <div className="flex flex-col items-center gap-2">
+                  <span className={`material-symbols-outlined text-2xl ${
+                    paymentMethod === 'cash' ? 'text-tertiary' : 'text-on-surface-variant'
+                  }`}>payments</span>
+                  <span className={`font-bold text-sm ${
+                    paymentMethod === 'cash' ? 'text-tertiary' : 'text-on-surface'
+                  }`}>Cash</span>
+                </div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setPaymentMethod('udhaar')}
+                className={`p-4 rounded-xl border-2 transition-all ${
+                  paymentMethod === 'udhaar'
+                    ? 'border-secondary bg-secondary-fixed/20 shadow-sm'
+                    : 'border-outline-variant/20 bg-surface-container-highest hover:bg-surface-bright'
+                }`}
+              >
+                <div className="flex flex-col items-center gap-2">
+                  <span className={`material-symbols-outlined text-2xl ${
+                    paymentMethod === 'udhaar' ? 'text-secondary' : 'text-on-surface-variant'
+                  }`}>menu_book</span>
+                  <span className={`font-bold text-sm ${
+                    paymentMethod === 'udhaar' ? 'text-secondary' : 'text-on-surface'
+                  }`}>Udhaar</span>
+                </div>
+              </button>
+            </div>
+          </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-bold text-on-surface mb-1">Customer Name</label>
