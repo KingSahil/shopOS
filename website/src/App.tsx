@@ -18,7 +18,6 @@ import { AuthProvider, useAuth } from './contexts/AuthContext';
 function AppContent() {
   const [currentView, setCurrentView] = useState<ViewState>('landing');
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
-  const [selectedCustomer, setSelectedCustomer] = useState<any>(null);
   const { user, loading, signInWithGoogle } = useAuth();
 
   if (loading) {
@@ -73,9 +72,9 @@ function AppContent() {
       case 'orderDetails':
         return <OrderDetailsView setCurrentView={setCurrentView} orderId={selectedOrderId} />;
       case 'udhar':
-        return <UdharView setCurrentView={setCurrentView} setSelectedCustomer={setSelectedCustomer} />;
+        return <UdharView setCurrentView={setCurrentView} />;
       case 'customerDetails':
-        return <CustomerDetailsView setCurrentView={setCurrentView} selectedCustomer={selectedCustomer} />;
+        return <CustomerDetailsView setCurrentView={setCurrentView} />;
       case 'inventory':
         return <InventoryView />;
       case 'finance':

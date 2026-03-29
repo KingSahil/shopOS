@@ -103,7 +103,6 @@ export default function InventoryView() {
   const [isStartingScanner, setIsStartingScanner] = useState(false);
   const [isLookingUpProduct, setIsLookingUpProduct] = useState(false);
   const [scannerError, setScannerError] = useState('');
-  const [stats, setStats] = useState({ totalValue: 0, lowStockCount: 0, categoryCount: 0, lowestStockItem: null as any });
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const scannerStreamRef = useRef<MediaStream | null>(null);
   const scannerFrameRef = useRef<number | null>(null);
@@ -468,19 +467,7 @@ export default function InventoryView() {
         });
       });
 
-      const items = Array.from(groupedItems.values());
-      const totalValue = items.reduce((sum: number, item: any) => sum + (Number(item.price) || 0), 0);
-      const lowStockCount = items.filter((item: any) => item.status === 'error').length;
-      const categoryCount = new Set(items.map((item: any) => item.category).filter(Boolean)).size;
-      const lowestStockItem = items.length > 0
-        ? items.slice().sort((a: any, b: any) => {
-            const ratioA = a.maxStock > 0 ? a.stock / a.maxStock : 1;
-            const ratioB = b.maxStock > 0 ? b.stock / b.maxStock : 1;
-            return ratioA - ratioB;
-          })[0]
-        : null;
-      setStats({ totalValue, lowStockCount, categoryCount, lowestStockItem });
-      setInventoryItems(items);
+      setInventoryItems(Array.from(groupedItems.values()));
       setIsLoading(false);
     }, (error) => {
       handleFirestoreError(error, OperationType.GET, `users/${auth.currentUser?.uid}/inventory`);
@@ -620,11 +607,11 @@ export default function InventoryView() {
           <div className="md:col-span-2 glass-gradient p-6 rounded-[1.5rem] text-white flex flex-col justify-between h-44 ambient-shadow">
             <div>
               <p className="text-on-primary-container text-sm font-medium opacity-80">Total Inventory Value</p>
-              <h3 className="text-3xl font-headline font-extrabold mt-1">₹{stats.totalValue.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</h3>
+              <h3 className="text-3xl font-headline font-extrabold mt-1">₹12,84,500.00</h3>
             </div>
             <div className="flex items-center gap-2 text-sm bg-white/10 w-fit px-3 py-1 rounded-full backdrop-blur-sm">
-              <span className="material-symbols-outlined text-xs">inventory_2</span>
-              <span>{inventoryItems.length} product{inventoryItems.length !== 1 ? 's' : ''} tracked</span>
+              <span className="material-symbols-outlined text-xs">trending_up</span>
+              <span>4.2% from last month</span>
             </div>
           </div>
 
@@ -637,7 +624,7 @@ export default function InventoryView() {
             </div>
             <div>
               <p className="text-on-surface-variant text-sm font-medium">Low Stock Alerts</p>
-              <h3 className="text-2xl font-headline font-extrabold text-on-surface">{stats.lowStockCount} Item{stats.lowStockCount !== 1 ? 's' : ''}</h3>
+              <h3 className="text-2xl font-headline font-extrabold text-on-surface">12 Items</h3>
             </div>
           </div>
 
@@ -649,7 +636,7 @@ export default function InventoryView() {
             </div>
             <div>
               <p className="text-on-surface-variant text-sm font-medium">Categories</p>
-              <h3 className="text-2xl font-headline font-extrabold text-on-surface">{stats.categoryCount} Sector{stats.categoryCount !== 1 ? 's' : ''}</h3>
+              <h3 className="text-2xl font-headline font-extrabold text-on-surface">18 Sectors</h3>
             </div>
           </div>
         </div>
@@ -684,34 +671,15 @@ export default function InventoryView() {
             <span className="material-symbols-outlined text-3xl filled">auto_awesome</span>
           </div>
           <div className="flex-1 text-center md:text-left">
-            {stats.lowestStockItem ? (
-              <>
-                <h4 className="font-headline font-bold text-lg text-secondary">AI Prediction: Restock Alert</h4>
-                <p className="text-on-surface-variant text-sm mt-1">
-                  Based on seasonal trends and current sales velocity, &quot;{stats.lowestStockItem.name}&quot; will be out of stock in{' '}
-                  <span className="text-error font-bold">
-                    {stats.lowestStockItem.stock === 0
-                      ? 'already depleted'
-                      : `${Math.max(1, Math.ceil(stats.lowestStockItem.stock / 3))} day${Math.max(1, Math.ceil(stats.lowestStockItem.stock / 3)) !== 1 ? 's' : ''}`}
-                  </span>.
-                  {' '}We recommend ordering {Math.max(20, Math.ceil((stats.lowestStockItem.maxStock || 100) * 0.5))} units today.
-                </p>
-              </>
-            ) : (
-              <>
-                <h4 className="font-headline font-bold text-lg text-secondary">AI Prediction: Inventory Stable</h4>
-                <p className="text-on-surface-variant text-sm mt-1">All inventory items are well stocked. Keep monitoring for early restock alerts.</p>
-              </>
-            )}
+            <h4 className="font-headline font-bold text-lg text-secondary">AI Prediction: Restock Alert</h4>
+            <p className="text-on-surface-variant text-sm mt-1">Based on seasonal trends and current sales velocity, "Dhara Mustard Oil (1L)" will be out of stock in <span className="text-error font-bold">3 days</span>. We recommend ordering 15 cases today.</p>
           </div>
-          {stats.lowestStockItem && (
-            <button
-              onClick={() => showToast('Restock order placed successfully!', 'success')}
-              className="bg-secondary/10 text-secondary border border-secondary/20 px-6 py-3 rounded-full font-bold text-sm hover:bg-secondary hover:text-white transition-all h-12"
-            >
-              Order Now
-            </button>
-          )}
+          <button 
+            onClick={() => showToast('Order placed successfully!', 'success')}
+            className="bg-secondary/10 text-secondary border border-secondary/20 px-6 py-3 rounded-full font-bold text-sm hover:bg-secondary hover:text-white transition-all h-12"
+          >
+            Order Now
+          </button>
         </div>
 
         {/* Inventory List (Asymmetric/Modern Layout) */}
@@ -803,7 +771,7 @@ export default function InventoryView() {
 
         {/* Pagination */}
         <div className="mt-12 flex flex-col sm:flex-row justify-between items-center gap-4 bg-surface-container-lowest px-6 py-4 rounded-2xl ghost-border ambient-shadow">
-          <span className="text-sm text-on-surface-variant font-medium">Showing <span className="text-on-surface font-bold">1–{Math.min(10, inventoryItems.length)}</span> of {inventoryItems.length} product{inventoryItems.length !== 1 ? 's' : ''}</span>
+          <span className="text-sm text-on-surface-variant font-medium">Showing <span className="text-on-surface font-bold">1-10</span> of 1,242 products</span>
           <div className="flex gap-2">
             <button 
               onClick={() => showToast('Previous page', 'info')}

@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import TopBar from '../components/TopBar';
 import { useToast } from '../contexts/ToastContext';
 import Modal from '../components/Modal';
-import { collection, onSnapshot, query, orderBy, setDoc, doc, updateDoc, increment } from 'firebase/firestore';
+import { collection, onSnapshot, query, orderBy } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from '../firebase';
 
 export default function InsightsView() {
@@ -11,8 +11,6 @@ export default function InsightsView() {
   const [selectedOpportunity, setSelectedOpportunity] = useState<{title: string, desc: string} | null>(null);
   const [insights, setInsights] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [insightsSummary, setInsightsSummary] = useState<any>(null);
-  const [isSummaryLoading, setIsSummaryLoading] = useState(true);
 
   useEffect(() => {
     if (!auth.currentUser) return;
@@ -36,66 +34,9 @@ export default function InsightsView() {
     return () => unsubscribe();
   }, []);
 
-  useEffect(() => {
-    if (!auth.currentUser) return;
-    
-    const summaryDocRef = doc(db, `users/${auth.currentUser.uid}/insights/summary`);
-    
-    const unsubscribe = onSnapshot(summaryDocRef, async (docSnap) => {
-      if (docSnap.exists()) {
-        setInsightsSummary(docSnap.data());
-        setIsSummaryLoading(false);
-      } else {
-        // Initialize default insights summary
-        const defaultData = {
-          growthForecast: 18.4,
-          deadStock: 2.4,
-          overstock: 8.1,
-          inventoryHealth: 94,
-          earlyMorningBuyers: 42,
-          creditFirstRetailers: 28,
-          highVolumeWholesalers: 30,
-          peakActivityStart: '08:30 AM',
-          peakActivityEnd: '11:00 AM'
-        };
-        try {
-          await setDoc(summaryDocRef, defaultData);
-          setInsightsSummary(defaultData);
-        } catch (error) {
-          console.error('Error initializing insights summary:', error);
-        }
-        setIsSummaryLoading(false);
-      }
-    }, (error) => {
-      handleFirestoreError(error, OperationType.GET, `users/${auth.currentUser?.uid}/insights/summary`);
-      showToast('Failed to load insights summary', 'error');
-      setIsSummaryLoading(false);
-    });
-
-    return () => unsubscribe();
-  }, []);
-
-  const handleRestock = async () => {
-    if (!auth.currentUser) return;
-    
-    try {
-      const restockData = {
-        orderedAt: new Date().toISOString(),
-        userId: auth.currentUser.uid,
-        product: 'Premium Basmati',
-        quantity: 500,
-        estimatedCost: 45000,
-        status: 'pending'
-      };
-      const restocksRef = collection(db, `users/${auth.currentUser.uid}/restocks`);
-      await setDoc(doc(restocksRef), restockData);
-      
-      showToast('Restock order placed successfully!', 'success');
-      setIsRestockModalOpen(false);
-    } catch (error) {
-      console.error('Error placing restock order:', error);
-      showToast('Failed to place restock order', 'error');
-    }
+  const handleRestock = () => {
+    showToast('Restock order placed successfully!', 'success');
+    setIsRestockModalOpen(false);
   };
 
   return (
@@ -114,11 +55,7 @@ export default function InsightsView() {
                 Live Forecast
               </span>
               <h3 className="text-3xl font-headline font-extrabold text-on-surface mb-2">Q4 Growth Trajectory</h3>
-              <p className="text-on-surface-variant font-body max-w-md mb-8">
-                AI models suggest a <span className="text-tertiary font-bold">
-                  {isSummaryLoading ? '...' : `+${insightsSummary?.growthForecast || 0}%`} surge
-                </span> in bulk orders for the next 21 days based on seasonal Diwali patterns.
-              </p>
+              <p className="text-on-surface-variant font-body max-w-md mb-8">AI models suggest a <span className="text-tertiary font-bold">+18.4% surge</span> in bulk orders for the next 21 days based on seasonal Diwali patterns.</p>
               
               <div className="flex items-end gap-2 h-32">
                 <div className="flex-1 bg-surface-container-highest rounded-t-lg h-[40%]"></div>
@@ -170,9 +107,9 @@ export default function InsightsView() {
             <h4 className="font-headline font-bold text-on-surface border-b border-surface-container pb-4">Customer Behavior</h4>
             <div className="space-y-4">
               {[
-                { label: 'Early Morning Buyers', value: isSummaryLoading ? '...' : `${insightsSummary?.earlyMorningBuyers || 0}%`, color: 'bg-secondary' },
-                { label: 'Credit-First Retailers', value: isSummaryLoading ? '...' : `${insightsSummary?.creditFirstRetailers || 0}%`, color: 'bg-primary-container' },
-                { label: 'High-Volume Wholesalers', value: isSummaryLoading ? '...' : `${insightsSummary?.highVolumeWholesalers || 0}%`, color: 'bg-tertiary' },
+                { label: 'Early Morning Buyers', value: '42%', color: 'bg-secondary' },
+                { label: 'Credit-First Retailers', value: '28%', color: 'bg-primary-container' },
+                { label: 'High-Volume Wholesalers', value: '30%', color: 'bg-tertiary' },
               ].map((stat, i) => (
                 <div key={i}>
                   <div className="flex items-center justify-between mb-2">
@@ -189,9 +126,7 @@ export default function InsightsView() {
               ))}
             </div>
             <div className="pt-2">
-              <p className="text-[11px] text-on-surface-variant italic">
-                Peak Activity: {isSummaryLoading ? '...' : `${insightsSummary?.peakActivityStart || '08:30 AM'} - ${insightsSummary?.peakActivityEnd || '11:00 AM'}`} IST
-              </p>
+              <p className="text-[11px] text-on-surface-variant italic">Peak Activity: 08:30 AM - 11:00 AM IST</p>
             </div>
           </div>
 
@@ -206,9 +141,7 @@ export default function InsightsView() {
               <div className="w-40 h-40 rounded-full border-[12px] border-surface-container-high relative">
                 <div className="absolute inset-0 rounded-full border-[12px] border-primary border-t-transparent border-r-transparent -rotate-45"></div>
                 <div className="absolute inset-0 flex flex-col items-center justify-center">
-                  <span className="text-2xl font-black text-on-surface">
-                    {isSummaryLoading ? '...' : `${insightsSummary?.inventoryHealth || 0}%`}
-                  </span>
+                  <span className="text-2xl font-black text-on-surface">94%</span>
                   <span className="text-[9px] uppercase tracking-tighter text-on-surface-variant">Optimal</span>
                 </div>
               </div>
@@ -216,15 +149,11 @@ export default function InsightsView() {
             <div className="mt-4 grid grid-cols-2 gap-4">
               <div className="text-center">
                 <p className="text-[10px] text-on-surface-variant uppercase">Dead Stock</p>
-                <p className="text-lg font-bold text-error">
-                  {isSummaryLoading ? '...' : `${insightsSummary?.deadStock || 0}%`}
-                </p>
+                <p className="text-lg font-bold text-error">2.4%</p>
               </div>
               <div className="text-center">
                 <p className="text-[10px] text-on-surface-variant uppercase">Overstock</p>
-                <p className="text-lg font-bold text-secondary">
-                  {isSummaryLoading ? '...' : `${insightsSummary?.overstock || 0}%`}
-                </p>
+                <p className="text-lg font-bold text-secondary">8.1%</p>
               </div>
             </div>
           </div>
@@ -241,21 +170,7 @@ export default function InsightsView() {
                 <div 
                   key={i} 
                   className="flex gap-4 group cursor-pointer"
-                  onClick={async () => {
-                    setSelectedOpportunity(opp);
-                    if (!auth.currentUser) return;
-                    try {
-                      const viewData = {
-                        viewedAt: new Date().toISOString(),
-                        userId: auth.currentUser.uid,
-                        opportunityTitle: opp.title
-                      };
-                      const viewsRef = collection(db, `users/${auth.currentUser.uid}/opportunity_views`);
-                      await setDoc(doc(viewsRef), viewData);
-                    } catch (error) {
-                      console.error('Error tracking opportunity view:', error);
-                    }
-                  }}
+                  onClick={() => setSelectedOpportunity(opp)}
                 >
                   <div className="w-12 h-12 rounded-full bg-surface-container flex-shrink-0 flex items-center justify-center group-hover:bg-primary-container group-hover:text-white transition-colors">
                     <span className="material-symbols-outlined">{opp.icon}</span>
@@ -275,24 +190,7 @@ export default function InsightsView() {
           <div className="px-8 py-6 flex justify-between items-center bg-surface-container-low">
             <h4 className="font-headline font-bold text-lg text-primary">Sales Forecasting by Category</h4>
             <button 
-              onClick={async () => {
-                if (!auth.currentUser) return;
-                try {
-                  showToast('Downloading Sales Forecast Report...', 'info');
-                  const reportData = {
-                    downloadedAt: new Date().toISOString(),
-                    userId: auth.currentUser.uid,
-                    type: 'sales_forecast_report',
-                    categoriesCount: insights.length
-                  };
-                  const reportsRef = collection(db, `users/${auth.currentUser.uid}/reports`);
-                  await setDoc(doc(reportsRef), reportData);
-                  showToast('Sales forecast report downloaded', 'success');
-                } catch (error) {
-                  console.error('Error downloading report:', error);
-                  showToast('Failed to download report', 'error');
-                }
-              }}
+              onClick={() => showToast('Downloading Sales Forecast Report...', 'info')}
               className="text-xs font-bold text-secondary flex items-center gap-1 hover:underline"
             >
               Download Report
@@ -382,19 +280,7 @@ export default function InsightsView() {
               Cancel
             </button>
             <button
-              onClick={async () => {
-                if (!auth.currentUser) return;
-                try {
-                  await handleRestock();
-                  const summaryDocRef = doc(db, `users/${auth.currentUser.uid}/insights/summary`);
-                  await updateDoc(summaryDocRef, {
-                    lastRestockOrder: new Date().toISOString(),
-                    restockCount: increment(1)
-                  });
-                } catch (error) {
-                  console.error('Error confirming restock:', error);
-                }
-              }}
+              onClick={handleRestock}
               className="px-6 py-2 rounded-full text-sm font-bold text-white glass-gradient hover:opacity-90 transition-opacity"
             >
               Confirm Order
@@ -423,22 +309,7 @@ export default function InsightsView() {
             </div>
             <div className="flex justify-end pt-4">
               <button
-                onClick={async () => {
-                  if (!auth.currentUser) return;
-                  try {
-                    const actionData = {
-                      acknowledgedAt: new Date().toISOString(),
-                      userId: auth.currentUser.uid,
-                      opportunityTitle: selectedOpportunity?.title
-                    };
-                    const actionsRef = collection(db, `users/${auth.currentUser.uid}/opportunity_actions`);
-                    await setDoc(doc(actionsRef), actionData);
-                    showToast('Opportunity acknowledged', 'success');
-                  } catch (error) {
-                    console.error('Error acknowledging opportunity:', error);
-                  }
-                  setSelectedOpportunity(null);
-                }}
+                onClick={() => setSelectedOpportunity(null)}
                 className="px-6 py-2 rounded-full text-sm font-bold text-white glass-gradient hover:opacity-90 transition-opacity"
               >
                 Got it
