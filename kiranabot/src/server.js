@@ -6,9 +6,9 @@ import {
   Browsers,
   fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
+import { createServer } from "node:http";
 import { rm, mkdir, readFile, unlink, open } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { stages } from "./stages.js";
 import { getState, setState } from "./storage.js";
 import { startCronJobs } from "./cron_jobs.js";
@@ -19,15 +19,14 @@ import { normalizePhoneNumber, extractPhoneFromJid } from './utils.js';
 import { getMenu } from './menu.js';
 import { updateBotStatusInFirebase, db, resolveStoreUserId } from './firebase_client.js';
 import { onSnapshot, doc, collection, query, where, updateDoc } from 'firebase/firestore';
+import { AUTH_PATH, DATA_DIR } from "./runtime_paths.js";
 
-const logger = Pino();
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const AUTH_PATH = resolve(__dirname, "../tokens/session-name");
 const LOCK_PATH = resolve(AUTH_PATH, ".bot.lock");
 const ALLOWED_PHONE_NUMBER = (process.env.ALLOWED_PHONE_NUMBER || "").replace(/\D/g, "");
 const ALLOWED_CHAT_JID = String(process.env.ALLOWED_CHAT_JID || "").trim();
 const ALLOW_FROM_ME = String(process.env.ALLOW_FROM_ME || "false").toLowerCase() === "true";
 const ADMIN_PHONE_NUMBER = (process.env.ADMIN_PHONE_NUMBER || "").replace(/\D/g, "");
+const HEALTH_PORT = Number.parseInt(process.env.PORT || "3000", 10);
 
 let client = null;
 let reconnectAttempts = 0;
@@ -40,6 +39,8 @@ let loggedMissingAllowedNumber = false;
 const loggedIgnoredReasons = new Set();
 const outboundQueueInFlight = new Set();
 let outboundQueueUnsubscribe = null;
+let botConnectionState = "starting";
+let healthServer = null;
 
 // Helper functions moved to utils.js
 
@@ -200,8 +201,60 @@ async function shutdownAndExit(code = 0) {
     // Ignore close errors during shutdown.
   }
 
+  try {
+    await new Promise((resolve, reject) => {
+      if (!healthServer) {
+        resolve();
+        return;
+      }
+
+      healthServer.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve();
+      });
+    });
+  } catch {
+    // Ignore HTTP server close errors during shutdown.
+  }
+
   await releaseProcessLock();
   process.exit(code);
+}
+
+function startHealthServer() {
+  if (healthServer) {
+    return;
+  }
+
+  healthServer = createServer((req, res) => {
+    if (req.url !== "/" && req.url !== "/health" && req.url !== "/healthz") {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "not_found" }));
+      return;
+    }
+
+    const isOnline = botConnectionState === "open";
+    const statusCode = botConnectionState === "closed" ? 503 : 200;
+
+    res.writeHead(statusCode, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: isOnline,
+        connection: botConnectionState,
+        dataDir: DATA_DIR,
+        authPath: AUTH_PATH,
+        botJid: client?.user?.id || null,
+      }),
+    );
+  });
+
+  healthServer.listen(HEALTH_PORT, "0.0.0.0", () => {
+    console.log(`🌐 Health server listening on port ${HEALTH_PORT}`);
+  });
 }
 
 function wait(ms) {
@@ -382,6 +435,7 @@ async function setupOutboundWhatsAppQueueListener() {
 }
 
 async function start() {
+  botConnectionState = "connecting";
   const { state, saveCreds } = await useMultiFileAuthState(
     AUTH_PATH
   );
@@ -444,6 +498,7 @@ async function start() {
     const { qr, connection, lastDisconnect, isOnline } = update;
 
       if (qr) {
+        botConnectionState = "waiting-for-scan";
         console.log("\n\n████████████████████████████████████████");
         console.log("👇👇👇 SCAN THIS QR CODE 👇👇👇");
         console.log("████████████████████████████████████████\n");
@@ -455,6 +510,7 @@ async function start() {
       }
 
       if (connection === "open") {
+        botConnectionState = "open";
         reconnectAttempts = 0;
         console.log("\n✅✅✅ WhatsApp connection is OPEN! ✅✅✅\n");
         updateBotStatusInFirebase({ qr: null, connection: "open", isOnline: true });
@@ -483,6 +539,7 @@ async function start() {
       }
 
       if (connection === "close") {
+        botConnectionState = "closed";
         const statusCode = getDisconnectCode(lastDisconnect);
         const reason = getDisconnectReason(statusCode);
 
@@ -513,7 +570,7 @@ async function start() {
             console.log("🔄 Attempting proactive reconnection with fresh session...");
             // Small delay to ensure files are cleared
             setTimeout(() => {
-              connectToWhatsApp().catch(err => {
+              start().catch(err => {
                 console.error("❌ Proactive reconnection failed:", err.message);
                 shutdownAndExit(1);
               });
@@ -741,6 +798,7 @@ async function start() {
 process.setMaxListeners(15);
 
 async function bootstrap() {
+  startHealthServer();
   const lockReady = await acquireProcessLock();
   if (!lockReady) {
     process.exit(1);
