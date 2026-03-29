@@ -17,6 +17,7 @@ interface WholesalerViewProps {
 
 export default function WholesalerView({ setCurrentView: setGlobalView }: WholesalerViewProps) {
   const [activeTab, setActiveTab] = useState<ViewState>('dashboard');
+  const [selectedCustomer, setSelectedCustomer] = useState<any>(null);
 
   const renderContent = () => {
     switch (activeTab) {
@@ -31,9 +32,9 @@ export default function WholesalerView({ setCurrentView: setGlobalView }: Wholes
       case 'inventory':
         return <InventoryView />;
       case 'udhar':
-        return <UdharView setCurrentView={setActiveTab} />;
+        return <UdharView setCurrentView={setActiveTab} setSelectedCustomer={setSelectedCustomer} />;
       case 'customerDetails':
-        return <CustomerDetailsView setCurrentView={setActiveTab} />;
+        return <CustomerDetailsView setCurrentView={setActiveTab} selectedCustomer={selectedCustomer} />;
       case 'insights':
         return <InsightsView />;
       case 'dashboard':
